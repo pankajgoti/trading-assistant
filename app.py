@@ -201,14 +201,136 @@ def get_india_vix():
         return None, "Unavailable"
 
 # =========================================================================
-# 6. REAL NSE OPTION CHAIN (OI, PCR, Max Pain, IV, ATM premium)
-# NOTE: nseindia.com aggressively rate-limits / blocks datacenter & cloud
-# IPs (including Streamlit Community Cloud) with Cloudflare-style checks.
-# This WILL sometimes fail when deployed — the app falls back to
-# "Option data unavailable" rather than faking a neutral PCR, so you can
-# always tell whether a signal used real options data or not.
-# For reliable production use, replace this with a paid vendor
-# (Kite Connect / Upstox / Sensibull / TrueData / Global Datafeeds API).
+# 6a. GROWW TRADE API — OFFICIAL, AUTHENTICATED OPTION CHAIN (preferred)
+# This is NOT web scraping — it's Groww's documented, free Trade API
+# (https://groww.in/trade-api/docs). It requires a daily-expiring access
+# token generated from: Groww app → Profile → Settings → Trading APIs →
+# Generate API Keys → Access Token. Paste it into Streamlit secrets as
+# GROWW_ACCESS_TOKEN each trading day (tokens expire daily by design —
+# this is a security requirement, not a bug). Because this is an
+# authenticated official API rather than a scraped page, it does not
+# suffer the random-blocking problem the NSE scraper has.
+# =========================================================================
+GROWW_INSTRUMENTS_URL = "https://growwapi-assets.groww.in/instruments/instrument.csv"
+
+def get_groww_headers():
+    token = st.secrets.get("GROWW_ACCESS_TOKEN", "")
+    if not token:
+        return None
+    return {"Accept": "application/json", "X-API-VERSION": "1.0", "Authorization": f"Bearer {token}"}
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def fetch_groww_instruments():
+    """Downloads Groww's public instrument master (no auth needed) — gives us
+    the real, current expiry dates and lot sizes straight from the exchange
+    feed, instead of a hardcoded/stale lookup table."""
+    try:
+        from io import StringIO
+        r = requests.get(GROWW_INSTRUMENTS_URL, timeout=20)
+        r.raise_for_status()
+        df = pd.read_csv(StringIO(r.text))
+        return df
+    except Exception:
+        return None
+
+def get_expiry_and_lotsize(raw_sym: str, instruments_df):
+    """Returns (nearest_expiry_YYYY-MM-DD, lot_size) for an underlying symbol,
+    sourced live from Groww's instrument master. Falls back to (None, None)
+    if unavailable — callers must handle that gracefully."""
+    if instruments_df is None or instruments_df.empty:
+        return None, None
+    try:
+        sub = instruments_df[
+            (instruments_df["underlying_symbol"] == raw_sym) &
+            (instruments_df["segment"] == "FNO")
+        ].copy()
+        if sub.empty:
+            return None, None
+        sub["expiry_date"] = pd.to_datetime(sub["expiry_date"], errors="coerce")
+        sub = sub.dropna(subset=["expiry_date"])
+        today = pd.Timestamp(datetime.now(IST).date())
+        future = sub[sub["expiry_date"] >= today]
+        if future.empty:
+            return None, None
+        nearest = future["expiry_date"].min()
+        lot_row = future[future["expiry_date"] == nearest]
+        lot_size = int(lot_row["lot_size"].iloc[0]) if not lot_row.empty else None
+        return nearest.strftime("%Y-%m-%d"), lot_size
+    except Exception:
+        return None, None
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_groww_option_chain(raw_sym: str, exchange: str, expiry_date: str):
+    headers = get_groww_headers()
+    if not headers or not expiry_date:
+        return None
+    try:
+        url = f"https://api.groww.in/v1/option-chain/exchange/{exchange}/underlying/{raw_sym}"
+        r = requests.get(url, headers=headers, params={"expiry_date": expiry_date}, timeout=8)
+        if r.status_code != 200:
+            return None
+        payload = r.json().get("payload", {})
+        underlying = payload.get("underlying_ltp")
+        strikes_raw = payload.get("strikes", {})
+        if not underlying or not strikes_raw:
+            return None
+
+        total_call_oi, total_put_oi = 0, 0
+        strikes = []
+        for strike_str, legs in strikes_raw.items():
+            try:
+                strike = float(strike_str)
+            except (TypeError, ValueError):
+                continue
+            ce = legs.get("CE") or {}
+            pe = legs.get("PE") or {}
+            ce_oi = ce.get("open_interest") or 0
+            pe_oi = pe.get("open_interest") or 0
+            total_call_oi += ce_oi
+            total_put_oi += pe_oi
+            strikes.append({
+                "strike": strike,
+                "CE": {"lastPrice": ce.get("ltp"), "openInterest": ce_oi,
+                       "impliedVolatility": (ce.get("greeks") or {}).get("iv"),
+                       "delta": (ce.get("greeks") or {}).get("delta"),
+                       "theta": (ce.get("greeks") or {}).get("theta")},
+                "PE": {"lastPrice": pe.get("ltp"), "openInterest": pe_oi,
+                       "impliedVolatility": (pe.get("greeks") or {}).get("iv"),
+                       "delta": (pe.get("greeks") or {}).get("delta"),
+                       "theta": (pe.get("greeks") or {}).get("theta")},
+            })
+        if not strikes:
+            return None
+
+        pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else None
+        atm_row = min(strikes, key=lambda x: abs(x["strike"] - underlying))
+
+        max_pain_strike, min_loss = None, None
+        for s in strikes:
+            loss = 0
+            for s2 in strikes:
+                loss += max(0, s["strike"] - s2["strike"]) * s2["CE"]["openInterest"]
+                loss += max(0, s2["strike"] - s["strike"]) * s2["PE"]["openInterest"]
+            if min_loss is None or loss < min_loss:
+                min_loss, max_pain_strike = loss, s["strike"]
+
+        return {
+            "underlying": underlying, "expiry": expiry_date, "pcr": pcr,
+            "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
+            "atm_strike": atm_row["strike"], "atm_ce": atm_row["CE"], "atm_pe": atm_row["PE"],
+            "max_pain": max_pain_strike, "source": "Groww (live)",
+        }
+    except Exception:
+        return None
+
+# =========================================================================
+# 6b. NSE SCRAPER — LAST-RESORT FALLBACK ONLY
+# Only used if GROWW_ACCESS_TOKEN isn't configured. nseindia.com
+# aggressively rate-limits / blocks datacenter & cloud IPs (including
+# Streamlit Community Cloud) with Cloudflare-style checks — this WILL
+# sometimes fail when deployed. The app shows "Option data unavailable"
+# rather than faking a neutral PCR, so you can always tell whether a
+# signal used real options data or not.
 # =========================================================================
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -293,10 +415,19 @@ def fetch_nse_option_chain(symbol: str, is_index: bool):
     except Exception:
         return None
 
+def parse_expiry_date(expiry_str: str):
+    """Handles both Groww (YYYY-MM-DD) and NSE scraper (DD-Mon-YYYY) formats."""
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(expiry_str, fmt).date()
+        except (ValueError, TypeError):
+            continue
+    return None
+
 def is_expiry_today(expiry_str: str) -> bool:
     try:
-        expiry_date = datetime.strptime(expiry_str, "%d-%b-%Y").date()
-        return expiry_date == datetime.now(IST).date()
+        expiry_date = parse_expiry_date(expiry_str)
+        return expiry_date == datetime.now(IST).date() if expiry_date else False
     except Exception:
         return False
 
@@ -402,7 +533,16 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         orb_bear = orb_low is not None and current_price < orb_low
 
         # --- Real NSE option chain (graceful fallback) ---
-        nse_chain = fetch_nse_option_chain(raw_sym if is_index else raw_sym, is_index)
+        instruments_df = fetch_groww_instruments()
+        groww_expiry, groww_lot_size = get_expiry_and_lotsize(raw_sym, instruments_df)
+        groww_exchange = "BSE" if raw_sym == "SENSEX" else "NSE"
+        nse_chain = fetch_groww_option_chain(raw_sym, groww_exchange, groww_expiry)
+        if nse_chain is None:
+            # Falls back to best-effort NSE scraping only if Groww isn't
+            # configured or the call failed.
+            nse_chain = fetch_nse_option_chain(raw_sym if is_index else raw_sym, is_index)
+        if nse_chain is not None and groww_lot_size:
+            nse_chain["lot_size"] = groww_lot_size
         pcr = nse_chain["pcr"] if nse_chain and nse_chain["pcr"] is not None else None
         expiry_today = is_expiry_today(nse_chain["expiry"]) if nse_chain else False
 
@@ -473,21 +613,24 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
                 target1 = round(current_price - atr_mult_t1 * current_atr, 2)
                 target2 = round(current_price - atr_mult_t2 * current_atr, 2)
 
-            # Premium & Greeks: prefer REAL NSE premium/IV, else Black-Scholes fallback
+            # Premium & Greeks: prefer REAL live premium/IV (Groww, then NSE), else Black-Scholes fallback
             leg = nse_chain["atm_ce"] if (nse_chain and bias == "BUY CALL") else (nse_chain["atm_pe"] if nse_chain else None)
+            data_source = nse_chain.get("source", "NSE live") if nse_chain else None
             if leg and leg.get("lastPrice"):
-                iv = leg.get("impliedVolatility", 0) / 100
                 premium_info = {
-                    "source": "NSE live",
+                    "source": data_source,
                     "premium": leg.get("lastPrice"),
                     "iv": leg.get("impliedVolatility"),
                     "oi": leg.get("openInterest"),
                     "chg_oi": leg.get("changeinOpenInterest"),
                 }
+                if leg.get("delta") is not None:
+                    premium_info["delta"] = leg.get("delta")
+                    premium_info["theta_per_day"] = leg.get("theta")
             elif nse_chain:
                 try:
-                    expiry_date = datetime.strptime(nse_chain["expiry"], "%d-%b-%Y").date()
-                    days_to_expiry = max((expiry_date - now_ist.date()).days, 0) + 0.25
+                    expiry_date = parse_expiry_date(nse_chain["expiry"])
+                    days_to_expiry = max((expiry_date - now_ist.date()).days, 0) + 0.25 if expiry_date else 3.25
                     T = days_to_expiry / 365
                     est_iv = 0.14 if is_index else 0.30
                     bs = bs_price_greeks(current_price, nse_chain["atm_strike"], T, est_iv,
@@ -515,11 +658,20 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
 # STREAMLIT DASHBOARD UI
 # =========================================================================
 st.title("⚡ AI Trading Assistant V4")
-st.markdown("Session-VWAP • Real NSE Option Chain • ATR Risk • India VIX Regime • ORB • Expiry-Aware")
+st.markdown("Session-VWAP • Live Groww Option Chain • ATR Risk • India VIX Regime • ORB • Expiry-Aware")
 
 is_open, status_label = market_status()
 if not is_open:
     st.markdown(f'<div class="warn-box">🕒 <b>{status_label}</b></div>', unsafe_allow_html=True)
+
+if not get_groww_headers():
+    st.markdown(
+        '<div class="warn-box">🔌 <b>Groww API not connected</b> — add <code>GROWW_ACCESS_TOKEN</code> '
+        'in Streamlit Secrets for live option-chain data (real PCR, IV, Greeks, and exact lot sizes). '
+        'Generate a token daily: Groww app → Profile → Settings → Trading APIs → Generate API Keys. '
+        'Without it, the app falls back to best-effort NSE scraping, which may be blocked on cloud hosting.</div>',
+        unsafe_allow_html=True
+    )
 
 vix_val, vix_regime = get_india_vix()
 vix_col1, vix_col2 = st.columns([1, 3])
@@ -539,11 +691,17 @@ if enable_autorefresh:
 
 st.sidebar.divider()
 st.sidebar.subheader("💰 Position Sizing (Option Buying)")
-st.sidebar.caption("Lot sizes are revised periodically by NSE — verify at nseindia.com before trading.")
+_instruments_df = fetch_groww_instruments()
+_live_expiry, _live_lot = get_expiry_and_lotsize(user_symbol, _instruments_df)
+if _live_lot:
+    st.sidebar.caption(f"✅ Lot size auto-fetched live from Groww instrument master (expiry {_live_expiry}).")
+    default_lot = _live_lot
+else:
+    st.sidebar.caption("⚠️ Live lot size unavailable — using a pre-filled estimate. Verify at nseindia.com/groww.in before trading.")
+    default_lot = DEFAULT_LOT_SIZES.get(user_symbol, 1)
 capital = st.sidebar.number_input("Trading Capital (₹)", min_value=1000, value=100000, step=1000)
 risk_pct = st.sidebar.slider("Max Risk per Trade (%)", 0.5, 5.0, 1.5, 0.5)
-default_lot = DEFAULT_LOT_SIZES.get(user_symbol, 1)
-lot_size = st.sidebar.number_input("Lot Size (verify current value)", min_value=1, value=default_lot, step=1)
+lot_size = st.sidebar.number_input("Lot Size (auto-filled, override if needed)", min_value=1, value=default_lot, step=1)
 premium_sl_pct = st.sidebar.slider("Premium Stop-Loss (%)", 10, 50, 30, 5,
                                     help="Common practice: exit an option buy if premium falls this % from entry.")
 
