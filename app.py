@@ -1,152 +1,91 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import datetime
 import requests
+import pandas as pd
+from nsepython import nse_eq
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(
-    page_title="AI Trading Assistant & Screener",
-    page_icon="📈",
-    layout="wide"
-)
+# Page Configuration
+st.set_page_config(page_title="Trading Assistant", page_icon="📈", layout="wide")
 
-# --- CUSTOM CSS FOR STYLING ---
-st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #1e2530;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #2d3748;
-        text-align: center;
+# --- 1. TELEGRAM BOT INTEGRATION ---
+def send_telegram_alert(message: str) -> bool:
+    """Sends a notification message to Telegram."""
+    bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
+
+    if not bot_token or not chat_id:
+        st.error("Telegram credentials missing in Streamlit Secrets.")
+        return False
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
     }
-    .bullish { color: #2ecc71; font-weight: bold; }
-    .bearish { color: #e74c3c; font-weight: bold; }
-    .neutral { color: #f1c40f; font-weight: bold; }
-    </style>
-""", unsafe_allow_html=True)
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.json().get("ok", False)
+    except Exception as e:
+        st.error(f"Failed to send Telegram alert: {e}")
+        return False
 
-# --- SIDEBAR CONFIGURATION ---
-st.sidebar.header("⚙️ Control Panel")
-selected_index = st.sidebar.selectbox("Select Index / Asset", ["NIFTY 50", "BANK NIFTY", "FINNIFTY"])
-timeframe = st.sidebar.selectbox("Primary Timeframe", ["5m", "15m", "1h", "Daily"])
-confidence_threshold = st.sidebar.slider("Min Confidence Threshold for Alert (%)", 50, 95, 80)
+# --- 2. LIVE NSE DATA FETCHING ---
+@st.cache_data(ttl=30)  # Caches result for 30 seconds to stay within NSE rate limits
+def fetch_nse_live_quote(symbol: str):
+    """Fetches real-time equity data directly from NSE."""
+    try:
+        data = nse_eq(symbol)
+        return data
+    except Exception as e:
+        st.error(f"Error fetching data for {symbol}: {e}")
+        return None
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("📲 Telegram Bot Setup")
-tg_token = st.sidebar.text_input("Bot Token", type="password")
-tg_chat_id = st.sidebar.text_input("Chat ID", type="password")
+# --- STREAMLIT USER INTERFACE ---
+st.title("📈 Live Trading Assistant")
+st.markdown("Real-time NSE stock data & automated Telegram alerting.")
 
-# --- MAIN DASHBOARD HEADER ---
-st.title(f"🤖 AI Trading Assistant: {selected_index}")
-st.markdown(f"**Current Time:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | **Mode:** Live Simulation")
+# Sidebar Controls
+st.sidebar.header("Configuration")
+symbol = st.sidebar.text_input("NSE Stock Symbol", value="RELIANCE").upper().strip()
+refresh = st.sidebar.button("🔄 Refresh Data")
 
-# --- MOCK DATA ENGINE (Replace with live broker/market feeds later) ---
-# In production, compute these dynamically using pandas/ta on live historical data.
-market_status = {
-    "Trend": ("Bullish", "🟢"),
-    "Strength": ("Strong", "🟢"),
-    "Momentum": ("High", "🟢"),
-    "VWAP": ("Above", "🟢"),
-    "ORB": ("Breakout", "🟢"),
-    "Volume": ("High", "🟢"),
-    "OI Build-up": ("Call Writing / Long", "🟢"),
-    "India VIX": ("13.4 (Moderate)", "🟡")
-}
-
-confidence_scores = {
-    "Trend Alignment (Multi-TF)": {"score": 20, "max": 20},
-    "Volume Expansion": {"score": 15, "max": 20},
-    "VWAP Positioning": {"score": 10, "max": 10},
-    "Options Data (OI/PCR)": {"score": 15, "max": 20},
-    "Smart Money Concepts (SMC)": {"score": 12, "max": 15},
-    "India VIX & Regime": {"score": 10, "max": 10},
-    "Market Breadth": {"score": 8, "max": 10},
-}
-
-total_confidence = sum([item["score"] for item in confidence_scores.values()])
-
-# --- LAYOUT: TWO COLUMNS (DASHBOARD & DECISION PANEL) ---
-col1, col2 = st.run_cols = st.columns([1.2, 1]) if hasattr(st, 'columns') else st.columns(2)
+col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.subheader("📊 Market Internal Matrix")
+    st.subheader(f"Live Market Data: `{symbol}`")
     
-    # Display Status Grid
-    status_df = pd.DataFrame(
-        [[v[1], k, v[0]] for k, v in market_status.items()],
-        columns=["Status", "Indicator", "Condition"]
-    )
-    st.table(status_df)
-    
-    st.subheader("🔍 AI Confidence Score Breakdown")
-    score_data = []
-    for k, v in confidence_scores.items():
-        pct = int((v["score"] / v["max"]) * 100)
-        score_data.append({"Component": k, "Score": f"{v['score']}/{v['max']}", "Health": f"{pct}%"})
-    st.dataframe(pd.DataFrame(score_data), hide_index=True, use_container_width=True)
+    with st.spinner("Fetching latest price from NSE..."):
+        stock_data = fetch_nse_live_quote(symbol)
+
+    if stock_data and "priceInfo" in stock_data:
+        price_info = stock_data["priceInfo"]
+        last_price = price_info.get("lastPrice", 0.0)
+        change = price_info.get("change", 0.0)
+        p_change = price_info.get("pChange", 0.0)
+        
+        # Display Key Metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Last Traded Price", f"₹{last_price:,.2f}", f"{change:+.2f} ({p_change:+.2f}%)")
+        m2.metric("Day High", f"₹{price_info.get('intraDayHighLow', {}).get('max', 0):,.2f}")
+        m3.metric("Day Low", f"₹{price_info.get('intraDayHighLow', {}).get('min', 0):,.2f}")
+
+        # Price Alert Condition Check
+        alert_threshold = st.number_input("Set Price Alert Threshold (₹):", value=float(last_price))
+        if st.button("Trigger Alert Evaluation"):
+            if last_price >= alert_threshold:
+                alert_text = f"🚨 *PRICE ALERT*\n\n*{symbol}* has crossed your target price!\nCurrent Price: ₹{last_price}\nTarget: ₹{alert_threshold}"
+                if send_telegram_alert(alert_text):
+                    st.success("Alert sent to Telegram!")
+            else:
+                st.info(f"Current price (₹{last_price}) has not reached target (₹{alert_threshold}).")
 
 with col2:
-    st.subheader("🎯 Automated Decision Hub")
+    st.subheader("📲 Send Manual Alert")
+    custom_msg = st.text_area("Custom Telegram Message", value=f"Update: {symbol} is currently trading at ₹{last_price if stock_data else 'N/A'}")
     
-    if total_confidence >= confidence_threshold:
-        st.markdown("""
-        <div style="background-color: #143d29; padding: 20px; border-radius: 10px; border: 1px solid #2ecc71;">
-            <h2 style="color: #2ecc71; margin:0;">DECISION: BUY CALL 🟢</h2>
-            <p style="font-size: 18px; margin-top: 5px;"><b>Confidence Score:</b> {}%</p>
-        </div>
-        """.format(total_confidence), unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div style="background-color: #4a2c2a; padding: 20px; border-radius: 10px; border: 1px solid #e74c3c;">
-            <h2 style="color: #e74c3c; margin:0;">DECISION: NO TRADE 🔴</h2>
-            <p style="font-size: 18px; margin-top: 5px;"><b>Confidence Score:</b> {}% (Below threshold)</p>
-        </div>
-        """.format(total_confidence), unsafe_allow_html=True)
-        
-    st.markdown("### Trade Parameters (Setup #104)")
-    param_col1, param_col2 = st.columns(2)
-    with param_col1:
-        st.metric(label="Recommended Strike", value="25200 CE")
-        st.metric(label="Entry Price", value="₹122.00")
-        st.metric(label="Target 1", value="₹145.00")
-    with param_col2:
-        st.metric(label="Stop Loss", value="₹108.00")
-        st.metric(label="Target 2", value="₹168.00")
-        st.metric(label="Target 3", value="Trail S/L")
-
-    st.markdown("#### 💡 AI Rationale")
-    st.markdown("""
-    * ✓ Price is cleanly sustained **above VWAP** on the 15m/5m charts.
-    * ✓ Volume nodes indicate accumulation near the Point of Control (POC).
-    * ✓ PCR shifted bullish with aggressive put writing at the 25200 strike.
-    * ✓ India VIX is steady, favoring directional trend day rules.
-    """)
-
-    # Telegram Alert Button
-    if st.button("🚀 Push Alert to Telegram Now"):
-        if tg_token and tg_chat_id:
-            message = f"🚨 *AI TRADING ALERT: {selected_index}* 🚨\n\nDecision: **BUY CALL**\nConfidence: **{total_confidence}%**\nStrike: 25200 CE\nEntry: ₹122\nStop Loss: ₹108\nTargets: ₹145 / ₹168"
-            url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-            payload = {"chat_id": tg_chat_id, "text": message, "parse_mode": "Markdown"}
-            try:
-                response = requests.post(url, json=payload)
-                if response.status_code == 200:
-                    st.success("Alert successfully broadcasted to Telegram!")
-                else:
-                    st.error(f"Failed to send. Error code: {response.status_code}")
-            except Exception as e:
-                st.error(f"Connection error: {e}")
+    if st.button("Send to Telegram"):
+        if send_telegram_alert(custom_msg):
+            st.success("Telegram notification delivered successfully!")
         else:
-            st.warning("Please input your Telegram Bot Token and Chat ID in the sidebar first.")
-
-# --- AUTOMATED JOURNAL SECTION ---
-st.markdown("---")
-st.subheader("📓 Automated Trade Journal Log")
-journal_data = pd.DataFrame([
-    {"Date": "2026-06-24", "Index": "NIFTY", "Type": "CE", "Entry": 110, "Exit": 142, "P&L (+/-)": "+₹1,600", "Result": "Win"},
-    {"Date": "2026-06-23", "Index": "BANK NIFTY", "Type": "PE", "Entry": 310, "Exit": 290, "P&L (+/-)": "-₹1,000", "Result": "Loss"},
-    {"Date": "2026-06-22", "Index": "NIFTY", "Type": "CE", "Entry": 95, "Exit": 130, "P&L (+/-)": "+₹1,750", "Result": "Win"},
-])
-st.dataframe(journal_data, hide_index=True, use_container_width=True)
+            st.error("Could not send Telegram notification.")
