@@ -7,35 +7,38 @@ import sqlite3
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-# Page Configuration
+# --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="AI Trading Assistant V2",
+    page_title="AI Trading Assistant V3",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Custom Styling
+# --- CUSTOM CSS STYLING ---
 st.markdown("""
 <style>
-    .metric-card {
-        background-color: #1E222D;
-        border-radius: 10px;
-        padding: 15px;
-        border: 1px solid #2A2E39;
-        text-align: center;
-    }
     .buy-call { color: #00E676; font-size: 28px; font-weight: bold; }
     .buy-put { color: #FF5252; font-size: 28px; font-weight: bold; }
     .neutral { color: #FFD600; font-size: 28px; font-weight: bold; }
+    .strike-box {
+        background-color: #1E222D;
+        padding: 12px;
+        border-radius: 8px;
+        border: 1px solid #2A2E39;
+        text-align: center;
+        font-size: 20px;
+        font-weight: bold;
+        color: #00E676;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. SQLITE DATABASE SETUP ---
+# --- 1. SQLITE TRADE JOURNAL DATABASE ---
 DB_NAME = "trade_journal.db"
 
 def init_db():
-    """Initializes SQLite database for automated trade journaling."""
+    """Initializes SQLite database for trade logging."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''
@@ -45,8 +48,11 @@ def init_db():
             symbol TEXT,
             price REAL,
             bias TEXT,
+            strike TEXT,
+            entry REAL,
+            sl REAL,
+            target REAL,
             score INTEGER,
-            vwap REAL,
             pcr REAL,
             notes TEXT
         )
@@ -54,19 +60,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-def log_trade(symbol, price, bias, score, vwap, pcr, notes="Auto-Logged"):
-    """Saves trade entry into SQLite database."""
+def log_trade(symbol, price, bias, strike, entry, sl, target, score, pcr, notes="Auto-Logged"):
+    """Saves a trade setup to SQLite database."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO journal (timestamp, symbol, price, bias, score, vwap, pcr, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), symbol, price, bias, score, vwap, pcr, notes))
+        INSERT INTO journal (timestamp, symbol, price, bias, strike, entry, sl, target, score, pcr, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), symbol, price, bias, strike, entry, sl, target, score, pcr, notes))
     conn.commit()
     conn.close()
 
 def get_journal_data():
-    """Fetches all trade entries from SQLite."""
+    """Fetches logged trades from SQLite."""
     conn = sqlite3.connect(DB_NAME)
     df = pd.read_sql_query("SELECT * FROM journal ORDER BY id DESC", conn)
     conn.close()
@@ -74,8 +80,9 @@ def get_journal_data():
 
 init_db()
 
-# --- 2. TELEGRAM NOTIFICATION FUNCTION ---
+# --- 2. TELEGRAM ALERT DISPATCHER ---
 def send_telegram_alert(message: str) -> bool:
+    """Delivers formatted trading signals to Telegram."""
     bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
 
@@ -90,23 +97,22 @@ def send_telegram_alert(message: str) -> bool:
         res = requests.post(url, json=payload, timeout=10)
         return res.json().get("ok", False)
     except Exception as e:
-        st.error(f"Telegram Delivery Failed: {e}")
+        st.error(f"Telegram Delivery Error: {e}")
         return False
 
-# --- 3. TECHNICAL ANALYSIS & OPTION CHAIN HELPERS ---
+# --- 3. TECHNICAL CALCULATIONS & OPTION STRIKE ENGINE ---
 def calculate_vwap(df: pd.DataFrame) -> pd.Series:
-    """Calculates Volume Weighted Average Price (VWAP)."""
+    """Calculates intraday Volume Weighted Average Price (VWAP)."""
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
     return (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
 
 def get_option_chain_pcr(ticker_obj) -> float:
-    """Calculates Put-Call Ratio (PCR) from option open interest."""
+    """Calculates Put-Call Ratio (PCR) from Open Interest."""
     try:
         expirations = ticker_obj.options
         if not expirations:
-            return 1.0  # Default neutral PCR
+            return 1.0
         
-        # Use nearest expiration cycle
         chain = ticker_obj.option_chain(expirations[0])
         total_call_oi = chain.calls['openInterest'].sum()
         total_put_oi = chain.puts['openInterest'].sum()
@@ -117,17 +123,40 @@ def get_option_chain_pcr(ticker_obj) -> float:
     except Exception:
         return 1.0
 
+def get_atm_strike(symbol: str, spot_price: float, bias: str) -> str:
+    """Calculates At-The-Money (ATM) option strike for Stocks & Indices."""
+    if "NIFTY" in symbol and "BANK" not in symbol:
+        step = 50
+    elif "BANKNIFTY" in symbol or "SENSEX" in symbol:
+        step = 100
+    else:
+        step = 10  # Standard step for equities
+        
+    atm_strike = round(spot_price / step) * step
+    option_type = "CE" if bias == "BUY CALL" else "PE"
+    return f"{int(atm_strike)} {option_type}"
+
 @st.cache_data(ttl=20)
-def analyze_stock(symbol: str):
-    """Fetches multi-timeframe data, Option Chain, & runs signal logic."""
-    ticker_sym = symbol.upper().strip()
-    if not ticker_sym.endswith(".NS") and not ticker_sym.startswith("^"):
+def analyze_market(symbol: str):
+    """Executes multi-timeframe trend, VWAP, PCR, and signal generation."""
+    raw_sym = symbol.upper().strip()
+    
+    # Symbol mapping for indices
+    index_map = {
+        "NIFTY": "^NSEI",
+        "NIFTY50": "^NSEI",
+        "BANKNIFTY": "^NSEBANK",
+        "SENSEX": "^BSESN"
+    }
+    
+    ticker_sym = index_map.get(raw_sym, raw_sym)
+    if not ticker_sym.startswith("^") and not ticker_sym.endswith(".NS"):
         ticker_sym += ".NS"
 
     try:
         ticker = yf.Ticker(ticker_sym)
         
-        # Fetch Multi-Timeframe Data
+        # Fetch multi-timeframe candles
         df_5m = ticker.history(period="5d", interval="5m")
         df_15m = ticker.history(period="10d", interval="15m")
         df_1h = ticker.history(period="1mo", interval="1h")
@@ -136,76 +165,84 @@ def analyze_stock(symbol: str):
         if df_5m.empty or len(df_5m) < 20:
             return None
 
-        # Current Price Metrics
+        # Price metrics
         current_price = df_5m['Close'].iloc[-1]
         prev_close = df_1d['Close'].iloc[-2] if len(df_1d) > 1 else current_price
         day_high = df_5m['High'].max()
         day_low = df_5m['Low'].min()
         price_change_pct = ((current_price - prev_close) / prev_close) * 100
 
-        # Multi-Timeframe Trend
+        # Trends across timeframes
         trend_1d = "BULLISH" if df_1d['Close'].iloc[-1] > df_1d['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
         trend_1h = "BULLISH" if df_1h['Close'].iloc[-1] > df_1h['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
         trend_15m = "BULLISH" if df_15m['Close'].iloc[-1] > df_15m['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
         trend_5m = "BULLISH" if df_5m['Close'].iloc[-1] > df_5m['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
 
-        # VWAP & Volume
+        # VWAP & Volume Surge
         df_5m['VWAP'] = calculate_vwap(df_5m)
         current_vwap = df_5m['VWAP'].iloc[-1]
         above_vwap = current_price > current_vwap
 
         recent_vol = df_5m['Volume'].iloc[-1]
         avg_vol = df_5m['Volume'].rolling(20).mean().iloc[-1]
-        high_volume = recent_vol > (1.5 * avg_vol)
+        high_vol = recent_vol > (1.5 * avg_vol)
 
-        # Option Chain Put-Call Ratio
+        # Put-Call Ratio
         pcr = get_option_chain_pcr(ticker)
 
-        # Confidence Score Calculation
+        # Confidence Score Logic
         score = 0
         checks = {}
 
-        # Rule 1: Multi-timeframe Alignment (+30 pts)
         aligned_bullish = (trend_1d == "BULLISH" and trend_1h == "BULLISH" and trend_15m == "BULLISH")
         aligned_bearish = (trend_1d == "BEARISH" and trend_1h == "BEARISH" and trend_15m == "BEARISH")
         
         if aligned_bullish or aligned_bearish:
             score += 30
-            checks["MTF Trend"] = (True, "1D, 1H, 15M Aligned")
+            checks["MTF Alignment"] = (True, "1D, 1H, 15M Aligned")
         else:
-            checks["MTF Trend"] = (False, "Mixed Timeframe Signals")
+            checks["MTF Alignment"] = (False, "Timeframe Conflict")
 
-        # Rule 2: VWAP Position (+25 pts)
         if (aligned_bullish and above_vwap) or (aligned_bearish and not above_vwap):
             score += 25
-            checks["VWAP"] = (True, f"{'Above' if above_vwap else 'Below'} VWAP")
+            checks["VWAP Confirmation"] = (True, f"{'Above' if above_vwap else 'Below'} VWAP")
         else:
-            checks["VWAP"] = (False, "Conflicting VWAP Position")
+            checks["VWAP Confirmation"] = (False, "Conflicting Price vs VWAP")
 
-        # Rule 3: Volume Surge (+20 pts)
-        if high_volume:
+        if high_vol or ticker_sym.startswith("^"):
             score += 20
-            checks["Volume"] = (True, f"Surge ({recent_vol:,.0f})")
+            checks["Volume / Momentum"] = (True, "Momentum Active")
         else:
-            checks["Volume"] = (False, "Normal Volume")
+            checks["Volume / Momentum"] = (False, "Normal Volume")
 
-        # Rule 4: Option Chain PCR Sentiment (+25 pts)
         if (aligned_bullish and pcr >= 1.0) or (aligned_bearish and pcr < 1.0):
             score += 25
-            checks["Option PCR"] = (True, f"PCR = {pcr} (Confirms sentiment)")
+            checks["Option PCR"] = (True, f"PCR = {pcr}")
         else:
             checks["Option PCR"] = (False, f"PCR = {pcr} (Divergence)")
 
-        # Decision Logic
+        # Decision, Strike & Risk-Reward Parameters
         if score >= 70 and aligned_bullish and above_vwap:
             bias = "BUY CALL"
+            strike = get_atm_strike(raw_sym, current_price, bias)
+            sl = round(current_price * 0.995, 2)
+            target1 = round(current_price * 1.008, 2)
+            target2 = round(current_price * 1.015, 2)
         elif score >= 70 and aligned_bearish and not above_vwap:
             bias = "BUY PUT"
+            strike = get_atm_strike(raw_sym, current_price, bias)
+            sl = round(current_price * 1.005, 2)
+            target1 = round(current_price * 0.992, 2)
+            target2 = round(current_price * 0.985, 2)
         else:
             bias = "NEUTRAL / NO TRADE"
+            strike = "N/A"
+            sl = 0.0
+            target1 = 0.0
+            target2 = 0.0
 
         return {
-            "symbol": symbol.upper(),
+            "symbol": raw_sym,
             "price": current_price,
             "change_pct": price_change_pct,
             "high": day_high,
@@ -213,6 +250,10 @@ def analyze_stock(symbol: str):
             "vwap": current_vwap,
             "pcr": pcr,
             "bias": bias,
+            "strike": strike,
+            "sl": sl,
+            "target1": target1,
+            "target2": target2,
             "score": score,
             "checks": checks,
             "trends": {"1D": trend_1d, "1H": trend_1h, "15M": trend_15m, "5M": trend_5m}
@@ -220,34 +261,33 @@ def analyze_stock(symbol: str):
     except Exception as e:
         return None
 
-# --- STREAMLIT UI ---
-st.title("⚡ AI Trading Assistant V2")
-st.markdown("Live Multi-Timeframe Screening, Option Chain PCR, & Automated SQLite Journaling.")
+# --- STREAMLIT DASHBOARD UI ---
+st.title("⚡ AI Trading Assistant V3")
+st.markdown("Live Multi-Timeframe Signals, Strike Selection, & Automated Telegram Dispatcher.")
 
-# Sidebar Configuration
+# Sidebar Controls
 st.sidebar.header("⚙️ Configuration")
-user_symbol = st.sidebar.text_input("Stock / Index Symbol", value="RELIANCE").upper().strip()
+user_symbol = st.sidebar.text_input("Symbol (e.g. NIFTY, SENSEX, RELIANCE)", value="NIFTY").upper().strip()
 
-# --- AUTO-REFRESH TIMER ---
-st.sidebar.subheader("🔄 Market Hours Auto-Refresh")
-enable_autorefresh = st.sidebar.checkbox("Enable Live Auto-Refresh", value=False)
-refresh_interval = st.sidebar.slider("Refresh Interval (seconds)", min_value=15, max_value=120, value=30)
+st.sidebar.subheader("🔄 Continuous Market Auto-Refresh")
+enable_autorefresh = st.sidebar.checkbox("Enable Auto-Refresh", value=False)
+refresh_interval = st.sidebar.slider("Refresh Timer (Seconds)", min_value=15, max_value=120, value=30)
 
 if enable_autorefresh:
-    st_autorefresh(interval=refresh_interval * 1000, key="market_screener_autorefresh")
+    st_autorefresh(interval=refresh_interval * 1000, key="market_auto_refresh")
 
-# Main Navigation Tabs
-tab_screener, tab_journal = st.tabs(["📊 Live Screener & Signals", "📓 Trade Journal (SQLite)"])
+# Interface Tabs
+tab_screener, tab_journal = st.tabs(["📊 Live Market Signals", "📓 SQLite Trade Journal"])
 
 with tab_screener:
-    data = analyze_stock(user_symbol)
+    data = analyze_market(user_symbol)
 
     if data:
-        # Metrics Header
+        # Top Metric Row
         col1, col2, col3, col4 = st.columns([1.5, 1.2, 1.2, 1.5])
         
         with col1:
-            st.markdown("**Decision**")
+            st.markdown("**Signal Bias**")
             if data["bias"] == "BUY CALL":
                 st.markdown(f'<div class="buy-call">🟢 {data["bias"]}</div>', unsafe_allow_html=True)
             elif data["bias"] == "BUY PUT":
@@ -262,46 +302,56 @@ with tab_screener:
 
         with col3:
             st.markdown("**Put-Call Ratio (PCR)**")
-            pcr_color = "🟢" if data["pcr"] >= 1.0 else "🔴"
-            st.markdown(f"### {pcr_color} **{data['pcr']}**")
+            pcr_icon = "🟢" if data["pcr"] >= 1.0 else "🔴"
+            st.markdown(f"### {pcr_icon} **{data['pcr']}**")
 
         with col4:
-            st.markdown("**Live Price**")
+            st.markdown("**Spot Price**")
             st.metric(
-                label=f"{data['symbol']} (NSE)", 
+                label=f"{data['symbol']}", 
                 value=f"₹{data['price']:,.2f}", 
                 delta=f"{data['change_pct']:+.2f}%"
             )
 
         st.divider()
 
-        # Indicators Bar
+        # Strike Price & Trade Levels Card
+        if data["bias"] != "NEUTRAL / NO TRADE":
+            st.subheader("🎯 Trade Execution Parameters")
+            p1, p2, p3, p4 = st.columns(4)
+            p1.markdown(f"**Recommended Strike**\n### `{data['strike']}`")
+            p2.markdown(f"**Entry Spot Price**\n### ₹{data['price']:,.2f}")
+            p3.markdown(f"**Stop Loss (SL)**\n### ₹{data['sl']:,.2f}")
+            p4.markdown(f"**Target 1 / Target 2**\n### ₹{data['target1']:,.2f} / ₹{data['target2']:,.2f}")
+            st.divider()
+
+        # Indicators Row
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("VWAP", f"₹{data['vwap']:,.2f}")
         m2.metric("Day High", f"₹{data['high']:,.2f}")
         m3.metric("Day Low", f"₹{data['low']:,.2f}")
-        m4.metric("1D Trend", data["trends"]["1D"])
+        m4.metric("1D Trend Direction", data["trends"]["1D"])
 
         st.divider()
 
-        # Multi-Timeframe Alignment & Checklist
+        # Trend Matrix & Checklist
         c1, c2 = st.columns(2)
 
         with c1:
             st.subheader("📊 Multi-Timeframe Alignment")
             t_df = pd.DataFrame([data["trends"]]).T
-            t_df.columns = ["Trend Direction"]
+            t_df.columns = ["Direction"]
             st.table(t_df)
 
         with c2:
-            st.subheader("🎯 Signal Checklist")
+            st.subheader("🎯 System Checklist")
             for check, (passed, desc) in data["checks"].items():
                 icon = "🟢" if passed else "🔴"
                 st.write(f"{icon} **{check}**: {desc}")
 
         st.divider()
 
-        # Actions: Telegram Alert & SQLite Logging
+        # Action Buttons
         act1, act2 = st.columns(2)
 
         with act1:
@@ -309,35 +359,39 @@ with tab_screener:
             alert_msg = (
                 f"🚨 *AI TRADING SIGNAL: {data['symbol']}*\n\n"
                 f"• *Decision:* `{data['bias']}`\n"
-                f"• *Confidence:* `{data['score']}%`\n"
-                f"• *Current Price:* ₹{data['price']:,.2f}\n"
-                f"• *VWAP:* ₹{data['vwap']:,.2f}\n"
-                f"• *PCR:* `{data['pcr']}`\n"
-                f"• *MTF Trends:* `{data['trends']['1D']} / {data['trends']['1H']} / {data['trends']['15M']}`\n\n"
+                f"• *Recommended Strike:* `{data['strike']}`\n"
+                f"• *Entry Price:* ₹{data['price']:,.2f}\n"
+                f"• *Stop Loss:* ₹{data['sl']:,.2f}\n"
+                f"• *Target 1:* ₹{data['target1']:,.2f}\n"
+                f"• *Confidence Score:* `{data['score']}%`\n"
+                f"• *PCR Ratio:* `{data['pcr']}`\n\n"
                 f"⏰ _Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}_"
             )
-            st.text_area("Alert Preview", value=alert_msg, height=120)
-            if st.button("🚀 Send Signal to Telegram"):
+            st.text_area("Telegram Preview", value=alert_msg, height=140)
+            if st.button("🚀 Send Alert to Telegram"):
                 if send_telegram_alert(alert_msg):
-                    st.success("✅ Telegram signal sent!")
+                    st.success("✅ Signal broadcasted to Telegram successfully!")
 
         with act2:
             st.subheader("📓 Journal Entry Logging")
-            notes = st.text_input("Trade Notes", value=f"{data['bias']} signal setup for {data['symbol']}")
-            if st.button("💾 Log Signal to SQLite Database"):
+            notes = st.text_input("Custom Notes", value=f"{data['bias']} setup logged for {data['symbol']}")
+            if st.button("💾 Log Trade to SQLite Database"):
                 log_trade(
                     symbol=data['symbol'],
                     price=data['price'],
                     bias=data['bias'],
+                    strike=data['strike'],
+                    entry=data['price'],
+                    sl=data['sl'],
+                    target=data['target1'],
                     score=data['score'],
-                    vwap=data['vwap'],
                     pcr=data['pcr'],
                     notes=notes
                 )
-                st.success(f"✅ Successfully recorded trade in `{DB_NAME}`!")
+                st.success(f"✅ Trade recorded in SQLite (`{DB_NAME}`)!")
 
     else:
-        st.warning(f"Unable to analyze '{user_symbol}'. Please verify the stock ticker symbol (e.g., RELIANCE, INFY, TATAMOTORS).")
+        st.warning(f"Unable to fetch data for '{user_symbol}'. Try typing NIFTY, BANKNIFTY, SENSEX, or stock tickers like RELIANCE, TCS, INFY.")
 
 with tab_journal:
     st.subheader("📓 SQLite Automated Trade Journal History")
@@ -345,6 +399,6 @@ with tab_journal:
     
     if not journal_df.empty:
         st.dataframe(journal_df, use_container_width=True)
-        st.caption(f"Total Logged Trades: {len(journal_df)}")
+        st.caption(f"Total Entries Logged: {len(journal_df)}")
     else:
-        st.info("No trade entries logged yet. Log your first signal from the Live Screener tab!")
+        st.info("No trade entries logged yet. Log your first setup from the Live Market Signals tab!")
