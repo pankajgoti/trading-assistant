@@ -39,9 +39,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================================================================
-# LOT SIZES — NSE revises these periodically (last major revision Jan 2026).
-# ALWAYS verify current lot sizes at nseindia.com before sizing a real trade.
-# These are pre-fills only; the sidebar lets you override them.
+# LOT SIZES — Pre-fills only; sidebar lets you override them.
 # =========================================================================
 DEFAULT_LOT_SIZES = {
     "NIFTY": 65,
@@ -119,9 +117,7 @@ def send_telegram_alert(message: str) -> bool:
 # 3. MARKET HOURS / SESSION HELPERS
 # =========================================================================
 def market_status():
-    """Returns (is_open, label). NSE cash/F&O: 9:15-15:30 IST, Mon-Fri.
-    NOTE: this does NOT account for NSE trading holidays — cross-check
-    the NSE holiday calendar for full accuracy."""
+    """Returns (is_open, label). NSE cash/F&O: 9:15-15:30 IST, Mon-Fri."""
     now = datetime.now(IST)
     if now.weekday() >= 5:
         return False, "Market Closed (Weekend)"
@@ -137,8 +133,7 @@ def market_status():
 # 4. TECHNICAL CALCULATIONS
 # =========================================================================
 def calculate_session_vwap(df: pd.DataFrame) -> pd.Series:
-    """VWAP anchored to the CURRENT trading session only (resets daily),
-    not cumulative across the whole lookback window."""
+    """VWAP anchored to the CURRENT trading session only (resets daily)."""
     idx = df.index
     if idx.tz is not None:
         session_date = idx.tz_convert(IST).date
@@ -162,7 +157,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(period).mean()
 
 def opening_range(df_today: pd.DataFrame, minutes: int = 15):
-    """First N minutes of the session high/low (Opening Range Breakout ref)."""
+    """First N minutes of the session high/low."""
     if df_today.empty:
         return None, None
     idx = df_today.index
@@ -201,15 +196,7 @@ def get_india_vix():
         return None, "Unavailable"
 
 # =========================================================================
-# 6a. GROWW TRADE API — OFFICIAL, AUTHENTICATED OPTION CHAIN (preferred)
-# This is NOT web scraping — it's Groww's documented, free Trade API
-# (https://groww.in/trade-api/docs). It requires a daily-expiring access
-# token generated from: Groww app → Profile → Settings → Trading APIs →
-# Generate API Keys → Access Token. Paste it into Streamlit secrets as
-# GROWW_ACCESS_TOKEN each trading day (tokens expire daily by design —
-# this is a security requirement, not a bug). Because this is an
-# authenticated official API rather than a scraped page, it does not
-# suffer the random-blocking problem the NSE scraper has.
+# 6a. GROWW TRADE API — OFFICIAL OPTION CHAIN (PREFERRED)
 # =========================================================================
 GROWW_INSTRUMENTS_URL = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
@@ -221,9 +208,6 @@ def get_groww_headers():
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fetch_groww_instruments():
-    """Downloads Groww's public instrument master (no auth needed) — gives us
-    the real, current expiry dates and lot sizes straight from the exchange
-    feed, instead of a hardcoded/stale lookup table."""
     try:
         from io import StringIO
         r = requests.get(GROWW_INSTRUMENTS_URL, timeout=20)
@@ -234,9 +218,6 @@ def fetch_groww_instruments():
         return None
 
 def get_expiry_and_lotsize(raw_sym: str, instruments_df):
-    """Returns (nearest_expiry_YYYY-MM-DD, lot_size) for an underlying symbol,
-    sourced live from Groww's instrument master. Falls back to (None, None)
-    if unavailable — callers must handle that gracefully."""
     if instruments_df is None or instruments_df.empty:
         return None, None
     try:
@@ -324,13 +305,7 @@ def fetch_groww_option_chain(raw_sym: str, exchange: str, expiry_date: str):
         return None
 
 # =========================================================================
-# 6b. NSE SCRAPER — LAST-RESORT FALLBACK ONLY
-# Only used if GROWW_ACCESS_TOKEN isn't configured. nseindia.com
-# aggressively rate-limits / blocks datacenter & cloud IPs (including
-# Streamlit Community Cloud) with Cloudflare-style checks — this WILL
-# sometimes fail when deployed. The app shows "Option data unavailable"
-# rather than faking a neutral PCR, so you can always tell whether a
-# signal used real options data or not.
+# 6b. NSE SCRAPER — FALLBACK ONLY
 # =========================================================================
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -348,11 +323,7 @@ def fetch_nse_option_chain(symbol: str, is_index: bool):
         session.get("https://www.nseindia.com", timeout=6)
         session.get("https://www.nseindia.com/option-chain", timeout=6)
 
-        if is_index:
-            url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        else:
-            url = f"https://www.nseindia.com/api/option-chain-equities?symbol={symbol}"
-
+        url = f"https://www.nseindia.com/api/option-chain-{'indices' if is_index else 'equities'}?symbol={symbol}"
         resp = session.get(url, timeout=8)
         if resp.status_code != 200:
             return None
@@ -372,9 +343,7 @@ def fetch_nse_option_chain(symbol: str, is_index: bool):
         total_call_oi, total_put_oi = 0, 0
         strikes = []
         for r in rows:
-            ce = r.get("CE")
-            pe = r.get("PE")
-            strike = r.get("strikePrice")
+            ce, pe, strike = r.get("CE"), r.get("PE"), r.get("strikePrice")
             if ce:
                 total_call_oi += ce.get("openInterest", 0)
             if pe:
@@ -382,41 +351,29 @@ def fetch_nse_option_chain(symbol: str, is_index: bool):
             strikes.append({"strike": strike, "CE": ce, "PE": pe})
 
         pcr = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else None
-
-        # ATM strike = strike closest to underlying value
         atm_row = min(strikes, key=lambda x: abs(x["strike"] - underlying))
 
-        # Max Pain: strike where total option-writer payout is minimized
         max_pain_strike, min_loss = None, None
         for s in strikes:
             loss = 0
             for s2 in strikes:
                 if s2["CE"]:
-                    itm = max(0, s["strike"] - s2["strike"])
-                    loss += itm * s2["CE"].get("openInterest", 0)
+                    loss += max(0, s["strike"] - s2["strike"]) * s2["CE"].get("openInterest", 0)
                 if s2["PE"]:
-                    itm = max(0, s2["strike"] - s["strike"])
-                    loss += itm * s2["PE"].get("openInterest", 0)
+                    loss += max(0, s2["strike"] - s["strike"]) * s2["PE"].get("openInterest", 0)
             if min_loss is None or loss < min_loss:
-                min_loss = loss
-                max_pain_strike = s["strike"]
+                min_loss, max_pain_strike = loss, s["strike"]
 
         return {
-            "underlying": underlying,
-            "expiry": nearest_expiry,
-            "pcr": pcr,
-            "total_call_oi": total_call_oi,
-            "total_put_oi": total_put_oi,
-            "atm_strike": atm_row["strike"],
-            "atm_ce": atm_row["CE"],
-            "atm_pe": atm_row["PE"],
-            "max_pain": max_pain_strike,
+            "underlying": underlying, "expiry": nearest_expiry, "pcr": pcr,
+            "total_call_oi": total_call_oi, "total_put_oi": total_put_oi,
+            "atm_strike": atm_row["strike"], "atm_ce": atm_row["CE"], "atm_pe": atm_row["PE"],
+            "max_pain": max_pain_strike, "source": "NSE live",
         }
     except Exception:
         return None
 
 def parse_expiry_date(expiry_str: str):
-    """Handles both Groww (YYYY-MM-DD) and NSE scraper (DD-Mon-YYYY) formats."""
     for fmt in ("%Y-%m-%d", "%d-%b-%Y"):
         try:
             return datetime.strptime(expiry_str, fmt).date()
@@ -432,7 +389,7 @@ def is_expiry_today(expiry_str: str) -> bool:
         return False
 
 # =========================================================================
-# 7. BLACK-SCHOLES FALLBACK (used only if live NSE premium/IV unavailable)
+# 7. BLACK-SCHOLES FALLBACK
 # =========================================================================
 def _norm_cdf(x):
     return 0.5 * (1 + math.erf(x / math.sqrt(2)))
@@ -457,20 +414,13 @@ def bs_price_greeks(S, K, T_years, sigma, option_type, r=0.07):
     return {"price": round(price, 2), "delta": round(delta, 3), "theta_per_day": round(theta_per_day, 2)}
 
 # =========================================================================
-# 8. CORE ANALYSIS ENGINE
+# 8. CORE ANALYSIS ENGINE (UPDATED WITH WEEKEND FALLBACK)
 # =========================================================================
 def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain) -> str:
     if nse_chain and nse_chain.get("atm_strike"):
         strike = nse_chain["atm_strike"]
     else:
-        if "BANKNIFTY" in symbol:
-            step = 100
-        elif "NIFTY" in symbol:
-            step = 50
-        elif "SENSEX" in symbol:
-            step = 100
-        else:
-            step = 10
+        step = 100 if ("BANKNIFTY" in symbol or "SENSEX" in symbol) else (50 if "NIFTY" in symbol else 10)
         strike = round(spot_price / step) * step
     option_type = "CE" if bias == "BUY CALL" else "PE"
     return f"{int(strike)} {option_type}"
@@ -487,12 +437,17 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
 
     try:
         ticker = yf.Ticker(ticker_sym)
-        df_5m = ticker.history(period="5d", interval="5m")
+        df_5m = ticker.history(period="7d", interval="5m")
+        
+        # Weekend / Off-Market Fallback: Use 15m candles if 5m is empty or insufficient
+        if df_5m.empty or len(df_5m) < 10:
+            df_5m = ticker.history(period="7d", interval="15m")
+
         df_15m = ticker.history(period="10d", interval="15m")
         df_1h = ticker.history(period="1mo", interval="1h")
         df_1d = ticker.history(period="6mo", interval="1d")
 
-        if df_5m.empty or len(df_5m) < 20:
+        if df_5m.empty:
             return None
 
         current_price = df_5m['Close'].iloc[-1]
@@ -506,47 +461,41 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         trend_15m = "BULLISH" if df_15m['Close'].iloc[-1] > df_15m['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
         trend_5m = "BULLISH" if df_5m['Close'].iloc[-1] > df_5m['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
 
-        # --- Session-anchored VWAP (fixed) ---
         df_5m['VWAP'] = calculate_session_vwap(df_5m)
         current_vwap = df_5m['VWAP'].iloc[-1]
         above_vwap = current_price > current_vwap
 
-        # --- ATR for volatility-adjusted risk ---
         df_5m['ATR'] = calculate_atr(df_5m, 14)
         current_atr = df_5m['ATR'].iloc[-1]
         atr_avg = df_5m['ATR'].rolling(20).mean().iloc[-1]
         atr_expanding = bool(current_atr and atr_avg and current_atr > atr_avg)
         if not current_atr or np.isnan(current_atr):
-            current_atr = current_price * 0.003  # safety fallback ~0.3%
+            current_atr = current_price * 0.003
 
-        # --- Opening Range Breakout ---
         idx = df_5m.index
         today_key = idx.tz_convert(IST).date() if idx.tz is not None else idx.date
         last_day = today_key[-1]
-        df_today = df_5m[today_key == last_day] if hasattr(today_key, "__eq__") else df_5m
         try:
             df_today = df_5m[[d == last_day for d in today_key]]
         except Exception:
             df_today = df_5m.tail(75)
+
         orb_high, orb_low = opening_range(df_today, minutes=15)
         orb_bull = orb_high is not None and current_price > orb_high
         orb_bear = orb_low is not None and current_price < orb_low
 
-        # --- Real NSE option chain (graceful fallback) ---
         instruments_df = fetch_groww_instruments()
         groww_expiry, groww_lot_size = get_expiry_and_lotsize(raw_sym, instruments_df)
         groww_exchange = "BSE" if raw_sym == "SENSEX" else "NSE"
         nse_chain = fetch_groww_option_chain(raw_sym, groww_exchange, groww_expiry)
         if nse_chain is None:
-            # Falls back to best-effort NSE scraping only if Groww isn't
-            # configured or the call failed.
-            nse_chain = fetch_nse_option_chain(raw_sym if is_index else raw_sym, is_index)
+            nse_chain = fetch_nse_option_chain(raw_sym, is_index)
         if nse_chain is not None and groww_lot_size:
             nse_chain["lot_size"] = groww_lot_size
         pcr = nse_chain["pcr"] if nse_chain and nse_chain["pcr"] is not None else None
         expiry_today = is_expiry_today(nse_chain["expiry"]) if nse_chain else False
 
-        # ==================== CONFIDENCE SCORE (max 100) ====================
+        # --- CONFIDENCE SCORE (max 100) ---
         score = 0
         checks = {}
 
@@ -578,17 +527,14 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
             checks["Volatility Expansion (ATR)"] = (False, "ATR flat/contracting")
 
         if pcr is None:
-            checks["Option Chain (PCR)"] = (False, "NSE option data unavailable — not scored")
+            checks["Option Chain (PCR)"] = (False, "Option data unavailable — not scored")
         elif (aligned_bullish and pcr >= 1.0) or (aligned_bearish and pcr < 1.0):
             score += 25
             checks["Option Chain (PCR)"] = (True, f"PCR = {pcr}")
         else:
             checks["Option Chain (PCR)"] = (False, f"PCR = {pcr} (Divergence)")
 
-        # --- Volatility regime gate (VIX) ---
         vix_block = vix_val is not None and vix_val >= 22
-
-        # --- Expiry-day time cutoff for fresh option buying ---
         now_ist = datetime.now(IST)
         expiry_cutoff = expiry_today and now_ist.hour >= 14 and now_ist.minute >= 30
 
@@ -602,7 +548,6 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
 
         if bias != "NEUTRAL / NO TRADE":
             strike = get_atm_display_strike(raw_sym, current_price, bias, nse_chain)
-            # ATR-based spot SL/targets instead of fixed %
             atr_mult_sl, atr_mult_t1, atr_mult_t2 = 1.0, 1.5, 2.5
             if bias == "BUY CALL":
                 sl = round(current_price - atr_mult_sl * current_atr, 2)
@@ -613,7 +558,6 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
                 target1 = round(current_price - atr_mult_t1 * current_atr, 2)
                 target2 = round(current_price - atr_mult_t2 * current_atr, 2)
 
-            # Premium & Greeks: prefer REAL live premium/IV (Groww, then NSE), else Black-Scholes fallback
             leg = nse_chain["atm_ce"] if (nse_chain and bias == "BUY CALL") else (nse_chain["atm_pe"] if nse_chain else None)
             data_source = nse_chain.get("source", "NSE live") if nse_chain else None
             if leg and leg.get("lastPrice"):
@@ -699,6 +643,7 @@ if _live_lot:
 else:
     st.sidebar.caption("⚠️ Live lot size unavailable — using a pre-filled estimate. Verify at nseindia.com/groww.in before trading.")
     default_lot = DEFAULT_LOT_SIZES.get(user_symbol, 1)
+
 capital = st.sidebar.number_input("Trading Capital (₹)", min_value=1000, value=100000, step=1000)
 risk_pct = st.sidebar.slider("Max Risk per Trade (%)", 0.5, 5.0, 1.5, 0.5)
 lot_size = st.sidebar.number_input("Lot Size (auto-filled, override if needed)", min_value=1, value=default_lot, step=1)
