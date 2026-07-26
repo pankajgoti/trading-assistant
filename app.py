@@ -15,7 +15,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
-    page_title="AI Trading Assistant V4",
+    page_title="AI Trading Assistant V5 Pro",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -39,14 +39,14 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================================================================
-# LOT SIZES — Pre-fills only; sidebar lets you override them.
+# DEFAULT LOT SIZES — Pre-fills based on current exchange specifications
 # =========================================================================
 DEFAULT_LOT_SIZES = {
     "NIFTY": 65,
     "NIFTY50": 65,
     "BANKNIFTY": 30,
     "FINNIFTY": 60,
-    "MIDCPNIFTY": 140,
+    "MIDCPNIFTY": 120,
     "SENSEX": 20,
 }
 
@@ -130,15 +130,12 @@ def market_status():
     return True, "Market Open"
 
 # =========================================================================
-# 4. TECHNICAL CALCULATIONS
+# 4. TECHNICAL INDICATORS & SMC CALCULATIONS
 # =========================================================================
 def calculate_session_vwap(df: pd.DataFrame) -> pd.Series:
     """VWAP anchored to the CURRENT trading session only (resets daily)."""
     idx = df.index
-    if idx.tz is not None:
-        session_date = idx.tz_convert(IST).date
-    else:
-        session_date = idx.date
+    session_date = idx.tz_convert(IST).date if idx.tz is not None else idx.date
     df = df.copy()
     df["_session"] = session_date
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
@@ -156,6 +153,49 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculates Relative Strength Index (RSI)."""
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_supertrend(df: pd.DataFrame, period: int = 7, multiplier: float = 3.0) -> pd.Series:
+    """Calculates Intraday Supertrend line."""
+    hl2 = (df['High'] + df['Low']) / 2
+    atr = calculate_atr(df, period)
+    upperband = hl2 + (multiplier * atr)
+    lowerband = hl2 - (multiplier * atr)
+    
+    supertrend = pd.Series(index=df.index, dtype=float)
+    in_uptrend = True
+    
+    for i in range(1, len(df)):
+        if df['Close'].iloc[i] > upperband.iloc[i-1]:
+            in_uptrend = True
+        elif df['Close'].iloc[i] < lowerband.iloc[i-1]:
+            in_uptrend = False
+            
+        supertrend.iloc[i] = lowerband.iloc[i] if in_uptrend else upperband.iloc[i]
+        
+    return supertrend
+
+def detect_fvg(df: pd.DataFrame):
+    """Detects recent Fair Value Gaps (SMC Imbalances) in 3-candle sequence."""
+    if len(df) < 3:
+        return False, "N/A"
+    c1_high = df['High'].iloc[-3]
+    c3_low = df['Low'].iloc[-1]
+    c1_low = df['Low'].iloc[-3]
+    c3_high = df['High'].iloc[-1]
+    
+    if c3_low > c1_high:
+        return True, "Bullish FVG Active"
+    elif c3_high < c1_low:
+        return True, "Bearish FVG Active"
+    return False, "No Imbalance"
+
 def opening_range(df_today: pd.DataFrame, minutes: int = 15):
     """First N minutes of the session high/low."""
     if df_today.empty:
@@ -164,10 +204,7 @@ def opening_range(df_today: pd.DataFrame, minutes: int = 15):
     session_date = idx.tz_convert(IST).date()[0] if idx.tz is not None else idx.date[0]
     day_open = datetime.combine(session_date, datetime.min.time(), tzinfo=IST).replace(hour=9, minute=15)
     day_open_end = day_open + timedelta(minutes=minutes)
-    if idx.tz is not None:
-        mask = (idx.tz_convert(IST) >= day_open) & (idx.tz_convert(IST) < day_open_end)
-    else:
-        mask = (idx >= day_open.replace(tzinfo=None)) & (idx < day_open_end.replace(tzinfo=None))
+    mask = (idx.tz_convert(IST) >= day_open) & (idx.tz_convert(IST) < day_open_end) if idx.tz is not None else (idx >= day_open.replace(tzinfo=None)) & (idx < day_open_end.replace(tzinfo=None))
     orb_slice = df_today[mask]
     if orb_slice.empty:
         return None, None
@@ -389,32 +426,7 @@ def is_expiry_today(expiry_str: str) -> bool:
         return False
 
 # =========================================================================
-# 7. BLACK-SCHOLES FALLBACK
-# =========================================================================
-def _norm_cdf(x):
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-def _norm_pdf(x):
-    return math.exp(-x ** 2 / 2) / math.sqrt(2 * math.pi)
-
-def bs_price_greeks(S, K, T_years, sigma, option_type, r=0.07):
-    if T_years <= 0 or sigma <= 0 or S <= 0 or K <= 0:
-        return None
-    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T_years) / (sigma * math.sqrt(T_years))
-    d2 = d1 - sigma * math.sqrt(T_years)
-    if option_type == "CE":
-        price = S * _norm_cdf(d1) - K * math.exp(-r * T_years) * _norm_cdf(d2)
-        delta = _norm_cdf(d1)
-    else:
-        price = K * math.exp(-r * T_years) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
-        delta = _norm_cdf(d1) - 1
-    theta_per_day = (-(S * _norm_pdf(d1) * sigma) / (2 * math.sqrt(T_years)) -
-                      (r * K * math.exp(-r * T_years) *
-                       (_norm_cdf(d2) if option_type == "CE" else _norm_cdf(-d2)))) / 365
-    return {"price": round(price, 2), "delta": round(delta, 3), "theta_per_day": round(theta_per_day, 2)}
-
-# =========================================================================
-# 8. CORE ANALYSIS ENGINE (UPDATED WITH WEEKEND FALLBACK)
+# 7. CORE ANALYSIS ENGINE (UPDATED WITH SUPERTREND, RSI & SMC)
 # =========================================================================
 def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain) -> str:
     if nse_chain and nse_chain.get("atm_strike"):
@@ -439,7 +451,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         ticker = yf.Ticker(ticker_sym)
         df_5m = ticker.history(period="7d", interval="5m")
         
-        # Weekend / Off-Market Fallback: Use 15m candles if 5m is empty or insufficient
+        # Weekend / Off-Market Fallback: Use 15m candles if 5m is empty
         if df_5m.empty or len(df_5m) < 10:
             df_5m = ticker.history(period="7d", interval="15m")
 
@@ -472,6 +484,16 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         if not current_atr or np.isnan(current_atr):
             current_atr = current_price * 0.003
 
+        # --- NEW INDICATORS: RSI & SUPERTREND & SMC FVG ---
+        df_5m['RSI'] = calculate_rsi(df_5m, 14)
+        current_rsi = df_5m['RSI'].iloc[-1] if not df_5m['RSI'].empty else 50.0
+
+        df_5m['Supertrend'] = calculate_supertrend(df_5m, 7, 3.0)
+        supertrend_val = df_5m['Supertrend'].iloc[-1]
+        above_supertrend = current_price > supertrend_val
+
+        fvg_active, fvg_desc = detect_fvg(df_5m)
+
         idx = df_5m.index
         today_key = idx.tz_convert(IST).date() if idx.tz is not None else idx.date
         last_day = today_key[-1]
@@ -495,7 +517,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         pcr = nse_chain["pcr"] if nse_chain and nse_chain["pcr"] is not None else None
         expiry_today = is_expiry_today(nse_chain["expiry"]) if nse_chain else False
 
-        # --- CONFIDENCE SCORE (max 100) ---
+        # --- CONFIDENCE SCORE CALCULATION (max 100) ---
         score = 0
         checks = {}
 
@@ -503,7 +525,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         aligned_bearish = (trend_1d == "BEARISH" and trend_1h == "BEARISH" and trend_15m == "BEARISH")
 
         if aligned_bullish or aligned_bearish:
-            score += 25
+            score += 20
             checks["MTF Alignment"] = (True, "1D, 1H, 15M Aligned")
         else:
             checks["MTF Alignment"] = (False, "Timeframe Conflict")
@@ -514,22 +536,29 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         else:
             checks["Session VWAP"] = (False, "Conflicting Price vs Session VWAP")
 
+        if (aligned_bullish and above_supertrend) or (aligned_bearish and not above_supertrend):
+            score += 15
+            checks["Supertrend (7,3)"] = (True, f"{'Bullish' if above_supertrend else 'Bearish'} Supertrend")
+        else:
+            checks["Supertrend (7,3)"] = (False, "Price on wrong side of Supertrend")
+
+        if (aligned_bullish and current_rsi >= 50 and current_rsi <= 70) or \
+           (aligned_bearish and current_rsi <= 50 and current_rsi >= 30):
+            score += 10
+            checks["RSI Momentum"] = (True, f"RSI = {current_rsi:.1f} (In trend zone)")
+        else:
+            checks["RSI Momentum"] = (False, f"RSI = {current_rsi:.1f} (Overbought/Oversold/Flat)")
+
         if (aligned_bullish and orb_bull) or (aligned_bearish and orb_bear):
             score += 15
             checks["Opening Range Breakout"] = (True, "Price beyond opening range in trend direction")
         else:
             checks["Opening Range Breakout"] = (False, "No confirmed ORB breakout")
 
-        if atr_expanding:
-            score += 15
-            checks["Volatility Expansion (ATR)"] = (True, "ATR rising — momentum active")
-        else:
-            checks["Volatility Expansion (ATR)"] = (False, "ATR flat/contracting")
-
         if pcr is None:
             checks["Option Chain (PCR)"] = (False, "Option data unavailable — not scored")
         elif (aligned_bullish and pcr >= 1.0) or (aligned_bearish and pcr < 1.0):
-            score += 25
+            score += 20
             checks["Option Chain (PCR)"] = (True, f"PCR = {pcr}")
         else:
             checks["Option Chain (PCR)"] = (False, f"PCR = {pcr} (Divergence)")
@@ -539,11 +568,12 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         expiry_cutoff = expiry_today and now_ist.hour >= 14 and now_ist.minute >= 30
 
         bias, strike, sl, target1, target2 = "NEUTRAL / NO TRADE", "N/A", 0.0, 0.0, 0.0
+        rrr, breakeven = "N/A", 0.0
         premium_info = None
 
-        if score >= 70 and aligned_bullish and above_vwap and not vix_block and not expiry_cutoff:
+        if score >= 70 and aligned_bullish and above_vwap and above_supertrend and not vix_block and not expiry_cutoff:
             bias = "BUY CALL"
-        elif score >= 70 and aligned_bearish and not above_vwap and not vix_block and not expiry_cutoff:
+        elif score >= 70 and aligned_bearish and not above_vwap and not above_supertrend and not vix_block and not expiry_cutoff:
             bias = "BUY PUT"
 
         if bias != "NEUTRAL / NO TRADE":
@@ -558,38 +588,33 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
                 target1 = round(current_price - atr_mult_t1 * current_atr, 2)
                 target2 = round(current_price - atr_mult_t2 * current_atr, 2)
 
+            # --- CALCULATE RISK-TO-REWARD RATIO (RRR) ---
+            risk_dist = abs(current_price - sl)
+            reward_dist = abs(target1 - current_price)
+            rrr = f"1 : {round(reward_dist / risk_dist, 2)}" if risk_dist > 0 else "N/A"
+
             leg = nse_chain["atm_ce"] if (nse_chain and bias == "BUY CALL") else (nse_chain["atm_pe"] if nse_chain else None)
             data_source = nse_chain.get("source", "NSE live") if nse_chain else None
             if leg and leg.get("lastPrice"):
+                prem = leg.get("lastPrice")
                 premium_info = {
-                    "source": data_source,
-                    "premium": leg.get("lastPrice"),
-                    "iv": leg.get("impliedVolatility"),
-                    "oi": leg.get("openInterest"),
-                    "chg_oi": leg.get("changeinOpenInterest"),
+                    "source": data_source, "premium": prem, "iv": leg.get("impliedVolatility"),
+                    "oi": leg.get("openInterest"), "chg_oi": leg.get("changeinOpenInterest"),
                 }
                 if leg.get("delta") is not None:
                     premium_info["delta"] = leg.get("delta")
                     premium_info["theta_per_day"] = leg.get("theta")
-            elif nse_chain:
-                try:
-                    expiry_date = parse_expiry_date(nse_chain["expiry"])
-                    days_to_expiry = max((expiry_date - now_ist.date()).days, 0) + 0.25 if expiry_date else 3.25
-                    T = days_to_expiry / 365
-                    est_iv = 0.14 if is_index else 0.30
-                    bs = bs_price_greeks(current_price, nse_chain["atm_strike"], T, est_iv,
-                                          "CE" if bias == "BUY CALL" else "PE")
-                    if bs:
-                        premium_info = {"source": "Black-Scholes estimate (est. IV)", "premium": bs["price"],
-                                         "iv": est_iv * 100, "delta": bs["delta"], "theta_per_day": bs["theta_per_day"]}
-                except Exception:
-                    premium_info = None
+                
+                # Spot Breakeven level
+                strike_num = float(strike.split()[0]) if strike != "N/A" else current_price
+                breakeven = round(strike_num + prem, 2) if bias == "BUY CALL" else round(strike_num - prem, 2)
 
         return {
             "symbol": raw_sym, "price": current_price, "change_pct": price_change_pct,
             "high": day_high, "low": day_low, "vwap": current_vwap, "atr": current_atr,
+            "rsi": current_rsi, "supertrend": supertrend_val, "fvg_active": fvg_active, "fvg_desc": fvg_desc,
             "pcr": pcr, "bias": bias, "strike": strike, "sl": sl, "target1": target1, "target2": target2,
-            "score": score, "checks": checks,
+            "rrr": rrr, "breakeven": breakeven, "score": score, "checks": checks,
             "trends": {"1D": trend_1d, "1H": trend_1h, "15M": trend_15m, "5M": trend_5m},
             "orb_high": orb_high, "orb_low": orb_low,
             "nse_chain": nse_chain, "expiry_today": expiry_today, "expiry_cutoff": expiry_cutoff,
@@ -601,8 +626,8 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
 # =========================================================================
 # STREAMLIT DASHBOARD UI
 # =========================================================================
-st.title("⚡ AI Trading Assistant V4")
-st.markdown("Session-VWAP • Live Groww Option Chain • ATR Risk • India VIX Regime • ORB • Expiry-Aware")
+st.title("⚡ AI Trading Assistant V5 Pro")
+st.markdown("Session-VWAP • Supertrend • RSI Momentum • SMC FVG • Live Groww Option Chain • ATR Risk")
 
 is_open, status_label = market_status()
 if not is_open:
@@ -611,9 +636,7 @@ if not is_open:
 if not get_groww_headers():
     st.markdown(
         '<div class="warn-box">🔌 <b>Groww API not connected</b> — add <code>GROWW_ACCESS_TOKEN</code> '
-        'in Streamlit Secrets for live option-chain data (real PCR, IV, Greeks, and exact lot sizes). '
-        'Generate a token daily: Groww app → Profile → Settings → Trading APIs → Generate API Keys. '
-        'Without it, the app falls back to best-effort NSE scraping, which may be blocked on cloud hosting.</div>',
+        'in Streamlit Secrets for live option-chain data (real PCR, IV, Greeks, and exact lot sizes).</div>',
         unsafe_allow_html=True
     )
 
@@ -641,21 +664,13 @@ if _live_lot:
     st.sidebar.caption(f"✅ Lot size auto-fetched live from Groww instrument master (expiry {_live_expiry}).")
     default_lot = _live_lot
 else:
-    st.sidebar.caption("⚠️ Live lot size unavailable — using a pre-filled estimate. Verify at nseindia.com/groww.in before trading.")
+    st.sidebar.caption("⚠️ Live lot size unavailable — using pre-filled estimate.")
     default_lot = DEFAULT_LOT_SIZES.get(user_symbol, 1)
 
 capital = st.sidebar.number_input("Trading Capital (₹)", min_value=1000, value=100000, step=1000)
 risk_pct = st.sidebar.slider("Max Risk per Trade (%)", 0.5, 5.0, 1.5, 0.5)
 lot_size = st.sidebar.number_input("Lot Size (auto-filled, override if needed)", min_value=1, value=default_lot, step=1)
-premium_sl_pct = st.sidebar.slider("Premium Stop-Loss (%)", 10, 50, 30, 5,
-                                    help="Common practice: exit an option buy if premium falls this % from entry.")
-
-st.sidebar.divider()
-st.sidebar.caption(
-    "⚠️ Educational tool only. Not SEBI-registered investment advice. "
-    "Signals are rule-based, not guaranteed. Verify option data, lot sizes "
-    "and NSE holidays independently before trading real capital."
-)
+premium_sl_pct = st.sidebar.slider("Premium Stop-Loss (%)", 10, 50, 30, 5)
 
 tab_screener, tab_journal = st.tabs(["📊 Live Market Signals", "📓 Trade Journal"])
 
@@ -664,11 +679,9 @@ with tab_screener:
 
     if data:
         if data["expiry_today"]:
-            st.markdown('<div class="warn-box">📅 <b>Today is Expiry Day</b> — gamma/theta risk is elevated. '
-                        'Fresh option buying is auto-blocked after 2:30 PM IST.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="warn-box">📅 <b>Today is Expiry Day</b> — fresh option buying auto-blocked after 2:30 PM IST.</div>', unsafe_allow_html=True)
         if data["vix_block"]:
-            st.markdown('<div class="danger-box">🌪️ <b>India VIX is HIGH</b> — fresh naked option buying is '
-                        'suppressed. Consider spreads or standing aside.</div>', unsafe_allow_html=True)
+            st.markdown('<div class="danger-box">🌪️ <b>India VIX is HIGH</b> — fresh naked option buying is suppressed.</div>', unsafe_allow_html=True)
 
         col1, col2, col3, col4 = st.columns([1.5, 1.2, 1.2, 1.5])
         with col1:
@@ -687,7 +700,6 @@ with tab_screener:
             st.markdown("**Put-Call Ratio (PCR)**")
             if data["pcr"] is None:
                 st.markdown("### ⚪ N/A")
-                st.caption("NSE option data unavailable this refresh")
             else:
                 pcr_icon = "🟢" if data["pcr"] >= 1.0 else "🔴"
                 st.markdown(f"### {pcr_icon} **{data['pcr']}**")
@@ -698,27 +710,27 @@ with tab_screener:
         st.divider()
 
         if data["bias"] != "NEUTRAL / NO TRADE":
-            st.subheader("🎯 Trade Execution Parameters (Spot-Level, ATR-based)")
-            p1, p2, p3, p4 = st.columns(4)
+            st.subheader("🎯 Trade Execution Parameters")
+            p1, p2, p3, p4, p5 = st.columns(5)
             p1.markdown(f"**Recommended Strike**\n### `{data['strike']}`")
             p2.markdown(f"**Entry Spot Price**\n### ₹{data['price']:,.2f}")
             p3.markdown(f"**Stop Loss (SL)**\n### ₹{data['sl']:,.2f}")
             p4.markdown(f"**Target 1 / Target 2**\n### ₹{data['target1']:,.2f} / ₹{data['target2']:,.2f}")
-            st.caption(f"SL/targets sized off ATR(14) = ₹{data['atr']:.2f}, not a fixed %.")
+            p5.markdown(f"**Risk-Reward Ratio (RRR)**\n### `{data['rrr']}`")
 
             if data["premium_info"]:
                 pi = data["premium_info"]
-                st.subheader("💊 Option Premium & Greeks")
-                g1, g2, g3, g4 = st.columns(4)
+                st.subheader("💊 Option Premium & Breakeven Analytics")
+                g1, g2, g3, g4, g5 = st.columns(5)
                 g1.markdown(f"**Entry Premium**\n### ₹{pi['premium']}")
-                g2.markdown(f"**Implied Vol**\n### {pi.get('iv', 'N/A')}%")
+                g2.markdown(f"**Spot Breakeven**\n### ₹{data['breakeven']}")
+                g3.markdown(f"**Implied Vol**\n### {pi.get('iv', 'N/A')}%")
                 if "delta" in pi:
-                    g3.markdown(f"**Est. Delta**\n### {pi['delta']}")
-                    g4.markdown(f"**Est. Theta/day**\n### ₹{pi['theta_per_day']}")
+                    g4.markdown(f"**Est. Delta**\n### {pi['delta']}")
+                    g5.markdown(f"**Est. Theta/day**\n### ₹{pi['theta_per_day']}")
                 else:
-                    g3.markdown(f"**OI**\n### {pi.get('oi', 'N/A')}")
-                    g4.markdown(f"**Chg in OI**\n### {pi.get('chg_oi', 'N/A')}")
-                st.caption(f"Source: {pi['source']}")
+                    g4.markdown(f"**OI**\n### {pi.get('oi', 'N/A')}")
+                    g5.markdown(f"**Chg in OI**\n### {pi.get('chg_oi', 'N/A')}")
 
                 premium_sl_val = round(pi['premium'] * (premium_sl_pct / 100), 2)
                 max_loss_per_lot = premium_sl_val * lot_size
@@ -730,24 +742,15 @@ with tab_screener:
                 s1.markdown(f"**Risk Budget**\n### ₹{risk_amount:,.0f}")
                 s2.markdown(f"**Max Loss / Lot**\n### ₹{max_loss_per_lot:,.0f}")
                 s3.markdown(f"**Suggested Lots**\n### {suggested_lots}")
-                if suggested_lots == 0:
-                    st.warning("Risk budget is smaller than 1 lot's worst-case premium loss at this SL% — reduce lot size or widen capital.")
 
-            if data["nse_chain"] and data["nse_chain"].get("max_pain"):
-                st.caption(f"Max Pain (nearest expiry {data['nse_chain']['expiry']}): "
-                           f"₹{data['nse_chain']['max_pain']}")
             st.divider()
 
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Session VWAP", f"₹{data['vwap']:,.2f}")
-        m2.metric("Day High", f"₹{data['high']:,.2f}")
-        m3.metric("Day Low", f"₹{data['low']:,.2f}")
+        m2.metric("Supertrend (7,3)", f"₹{data['supertrend']:,.2f}")
+        m3.metric("RSI (14)", f"{data['rsi']:.1f}")
         m4.metric("ATR (14, 5m)", f"₹{data['atr']:,.2f}")
-
-        if data["orb_high"] and data["orb_low"]:
-            o1, o2 = st.columns(2)
-            o1.metric("Opening Range High (first 15m)", f"₹{data['orb_high']:,.2f}")
-            o2.metric("Opening Range Low (first 15m)", f"₹{data['orb_low']:,.2f}")
+        m5.metric("SMC FVG Imbalance", "🟢 Bullish" if "Bullish" in data["fvg_desc"] else ("🔴 Bearish" if "Bearish" in data["fvg_desc"] else "⚪ None"))
 
         st.divider()
 
@@ -768,9 +771,6 @@ with tab_screener:
         act1, act2 = st.columns(2)
         with act1:
             st.subheader("📲 Telegram Dispatcher")
-            premium_line = ""
-            if data["premium_info"]:
-                premium_line = f"• *Est. Premium:* ₹{data['premium_info']['premium']} ({data['premium_info']['source']})\n"
             alert_msg = (
                 f"🚨 *AI TRADING SIGNAL: {data['symbol']}*\n\n"
                 f"• *Decision:* `{data['bias']}`\n"
@@ -778,12 +778,10 @@ with tab_screener:
                 f"• *Entry Price:* ₹{data['price']:,.2f}\n"
                 f"• *Stop Loss:* ₹{data['sl']:,.2f}\n"
                 f"• *Target 1:* ₹{data['target1']:,.2f}\n"
-                f"{premium_line}"
+                f"• *Risk-Reward Ratio:* `{data['rrr']}`\n"
                 f"• *Confidence Score:* `{data['score']}%`\n"
-                f"• *PCR:* `{data['pcr'] if data['pcr'] is not None else 'N/A'}`\n"
-                f"• *India VIX:* `{vix_val if vix_val is not None else 'N/A'}` ({vix_regime})\n\n"
-                f"⏰ _Timestamp: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}_\n"
-                f"⚠️ Educational signal, not investment advice."
+                f"• *PCR:* `{data['pcr'] if data['pcr'] is not None else 'N/A'}`\n\n"
+                f"⏰ _Timestamp: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}_"
             )
             st.text_area("Telegram Preview", value=alert_msg, height=160)
             if st.button("🚀 Send Alert to Telegram"):
@@ -792,8 +790,6 @@ with tab_screener:
 
         with act2:
             st.subheader("📓 Journal Entry Logging")
-            st.caption("⚠️ SQLite on Streamlit Community Cloud is not persistent across "
-                       "redeploys/restarts. Export CSV regularly from the Journal tab as backup.")
             notes = st.text_input("Custom Notes", value=f"{data['bias']} setup logged for {data['symbol']}")
             if st.button("💾 Log Trade to Database"):
                 log_trade(
@@ -811,10 +807,9 @@ with tab_journal:
     journal_df = get_journal_data()
     if not journal_df.empty:
         st.dataframe(journal_df, use_container_width=True)
-        st.caption(f"Total Entries Logged: {len(journal_df)}")
         csv = journal_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Export Journal as CSV (backup)", data=csv,
+        st.download_button("⬇️ Export Journal as CSV", data=csv,
                             file_name=f"trade_journal_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
                             mime="text/csv")
     else:
-        st.info("No trade entries logged yet. Log your first setup from the Live Market Signals tab!")
+        st.info("No trade entries logged yet.")
