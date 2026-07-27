@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
@@ -114,7 +113,43 @@ def send_telegram_alert(message: str) -> bool:
         return False
 
 # =========================================================================
-# 3. MARKET HOURS / SESSION HELPERS
+# 3. DIRECT YAHOO HTTP FETCH (BYPASSES STREAMLIT CLOUD BLOCKS)
+# =========================================================================
+def fetch_yahoo_candles(ticker_sym: str, interval="5m", range_pd="5d") -> pd.DataFrame:
+    """Direct HTTP chart fetcher using real browser User-Agent."""
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_sym}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+        params = {"range": range_pd, "interval": interval}
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        result = r.json().get("chart", {}).get("result", [])
+        if not result:
+            return pd.DataFrame()
+        
+        timestamps = result[0].get("timestamp", [])
+        quote = result[0].get("indicators", {}).get("quote", [{}])[0]
+        if not timestamps or not quote:
+            return pd.DataFrame()
+            
+        df = pd.DataFrame({
+            "Open": quote.get("open"),
+            "High": quote.get("high"),
+            "Low": quote.get("low"),
+            "Close": quote.get("close"),
+            "Volume": quote.get("volume", [0]*len(timestamps))
+        }, index=pd.to_datetime(timestamps, unit='s', utc=True))
+        
+        df = df.dropna(subset=["Close"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# =========================================================================
+# 4. MARKET HOURS / SESSION HELPERS
 # =========================================================================
 def market_status():
     """Returns (is_open, label). NSE cash/F&O: 9:15-15:30 IST, Mon-Fri."""
@@ -130,7 +165,7 @@ def market_status():
     return True, "Market Open"
 
 # =========================================================================
-# 4. TECHNICAL INDICATORS & SMC CALCULATIONS
+# 5. TECHNICAL INDICATORS & SMC CALCULATIONS
 # =========================================================================
 def calculate_session_vwap(df: pd.DataFrame) -> pd.Series:
     """VWAP anchored to the CURRENT trading session only (resets daily)."""
@@ -211,12 +246,12 @@ def opening_range(df_today: pd.DataFrame, minutes: int = 15):
     return orb_slice['High'].max(), orb_slice['Low'].min()
 
 # =========================================================================
-# 5. INDIA VIX — VOLATILITY REGIME FILTER
+# 6. INDIA VIX — VOLATILITY REGIME FILTER
 # =========================================================================
 @st.cache_data(ttl=60)
 def get_india_vix():
     try:
-        vix_df = yf.Ticker("^INDIAVIX").history(period="5d", interval="15m")
+        vix_df = fetch_yahoo_candles("^INDIAVIX", interval="15m", range_pd="5d")
         if vix_df.empty:
             return None, "Unavailable"
         vix_val = round(float(vix_df['Close'].iloc[-1]), 2)
@@ -233,7 +268,7 @@ def get_india_vix():
         return None, "Unavailable"
 
 # =========================================================================
-# 6a. GROWW TRADE API — OFFICIAL OPTION CHAIN (PREFERRED)
+# 7a. GROWW TRADE API — OFFICIAL OPTION CHAIN (PREFERRED)
 # =========================================================================
 GROWW_INSTRUMENTS_URL = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
@@ -342,7 +377,7 @@ def fetch_groww_option_chain(raw_sym: str, exchange: str, expiry_date: str):
         return None
 
 # =========================================================================
-# 6b. NSE SCRAPER — FALLBACK ONLY
+# 7b. NSE SCRAPER — FALLBACK ONLY
 # =========================================================================
 NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -426,7 +461,7 @@ def is_expiry_today(expiry_str: str) -> bool:
         return False
 
 # =========================================================================
-# 7. CORE ANALYSIS ENGINE (RESILIENT YAHOO FETCHING)
+# 8. CORE ANALYSIS ENGINE (DIRECT HTTP FETCH FOR ALL TIMEFRAMES)
 # =========================================================================
 def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain) -> str:
     if nse_chain and nse_chain.get("atm_strike"):
@@ -437,7 +472,7 @@ def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain)
     option_type = "CE" if bias == "BUY CALL" else "PE"
     return f"{int(strike)} {option_type}"
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=15)
 def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
     raw_sym = symbol.upper().strip()
     is_index = raw_sym in NSE_INDEX_SYMBOLS
@@ -448,24 +483,14 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         ticker_sym += ".NS"
 
     try:
-        ticker = yf.Ticker(ticker_sym)
-        
-        # Resilient multi-interval fetch (prevents Streamlit Cloud IP throttling errors)
-        df_5m = pd.DataFrame()
-        for interval in ["5m", "15m", "1h"]:
-            try:
-                df_5m = ticker.history(period="7d", interval=interval)
-                if not df_5m.empty and len(df_5m) >= 5:
-                    break
-            except Exception:
-                continue
+        # Fetch candles using custom direct HTTP request to bypass Streamlit Cloud blocks
+        df_5m = fetch_yahoo_candles(ticker_sym, interval="5m", range_pd="5d")
+        if df_5m.empty or len(df_5m) < 5:
+            df_5m = fetch_yahoo_candles(ticker_sym, interval="15m", range_pd="7d")
 
-        if df_5m.empty:
-            df_5m = ticker.history(period="1mo", interval="1d")
-
-        df_15m = ticker.history(period="10d", interval="15m")
-        df_1h = ticker.history(period="1mo", interval="1h")
-        df_1d = ticker.history(period="6mo", interval="1d")
+        df_15m = fetch_yahoo_candles(ticker_sym, interval="15m", range_pd="10d")
+        df_1h = fetch_yahoo_candles(ticker_sym, interval="1h", range_pd="1mo")
+        df_1d = fetch_yahoo_candles(ticker_sym, interval="1d", range_pd="6mo")
 
         if df_5m.empty:
             return None
@@ -476,29 +501,27 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         day_low = df_5m['Low'].min()
         price_change_pct = ((current_price - prev_close) / prev_close) * 100
 
-        trend_1d = "BULLISH" if df_1d['Close'].iloc[-1] > df_1d['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
-        trend_1h = "BULLISH" if df_1h['Close'].iloc[-1] > df_1h['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
-        trend_15m = "BULLISH" if df_15m['Close'].iloc[-1] > df_15m['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
-        trend_5m = "BULLISH" if df_5m['Close'].iloc[-1] > df_5m['Close'].rolling(20).mean().iloc[-1] else "BEARISH"
+        trend_1d = "BULLISH" if len(df_1d) >= 20 and df_1d['Close'].iloc[-1] > df_1d['Close'].rolling(20).mean().iloc[-1] else ("BULLISH" if df_1d['Close'].iloc[-1] > prev_close else "BEARISH")
+        trend_1h = "BULLISH" if len(df_1h) >= 20 and df_1h['Close'].iloc[-1] > df_1h['Close'].rolling(20).mean().iloc[-1] else ("BULLISH" if df_1h['Close'].iloc[-1] > prev_close else "BEARISH")
+        trend_15m = "BULLISH" if len(df_15m) >= 20 and df_15m['Close'].iloc[-1] > df_15m['Close'].rolling(20).mean().iloc[-1] else ("BULLISH" if df_15m['Close'].iloc[-1] > prev_close else "BEARISH")
+        trend_5m = "BULLISH" if len(df_5m) >= 20 and df_5m['Close'].iloc[-1] > df_5m['Close'].rolling(20).mean().iloc[-1] else ("BULLISH" if df_5m['Close'].iloc[-1] > prev_close else "BEARISH")
 
         df_5m['VWAP'] = calculate_session_vwap(df_5m)
-        current_vwap = df_5m['VWAP'].iloc[-1]
-        above_vwap = current_price > current_vwap
+        current_vwap = df_5m['VWAP'].iloc[-1] if not df_5m['VWAP'].dropna().empty else current_price
+        above_vwap = current_price >= current_vwap
 
         df_5m['ATR'] = calculate_atr(df_5m, 14)
-        current_atr = df_5m['ATR'].iloc[-1]
-        atr_avg = df_5m['ATR'].rolling(20).mean().iloc[-1]
-        atr_expanding = bool(current_atr and atr_avg and current_atr > atr_avg)
-        if not current_atr or np.isnan(current_atr):
+        current_atr = df_5m['ATR'].iloc[-1] if not df_5m['ATR'].dropna().empty else current_price * 0.003
+        if np.isnan(current_atr) or current_atr <= 0:
             current_atr = current_price * 0.003
 
         # --- INDICATORS: RSI, SUPERTREND & SMC FVG ---
         df_5m['RSI'] = calculate_rsi(df_5m, 14)
-        current_rsi = df_5m['RSI'].iloc[-1] if not df_5m['RSI'].empty else 50.0
+        current_rsi = df_5m['RSI'].iloc[-1] if not df_5m['RSI'].dropna().empty else 50.0
 
         df_5m['Supertrend'] = calculate_supertrend(df_5m, 7, 3.0)
-        supertrend_val = df_5m['Supertrend'].iloc[-1]
-        above_supertrend = current_price > supertrend_val
+        supertrend_val = df_5m['Supertrend'].iloc[-1] if not df_5m['Supertrend'].dropna().empty else current_price
+        above_supertrend = current_price >= supertrend_val
 
         fvg_active, fvg_desc = detect_fvg(df_5m)
 
