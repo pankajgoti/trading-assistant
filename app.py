@@ -810,19 +810,41 @@ with tab_screener:
         act1, act2 = st.columns(2)
         with act1:
             st.subheader("📲 Telegram Dispatcher")
+            
+            # --- CALCULATE OPTION PREMIUM ENTRY, SL & TARGETS FOR TELEGRAM ---
+            if data['bias'] != "NEUTRAL / NO TRADE" and data.get("premium_info") and data["premium_info"].get("premium"):
+                prem_entry = float(data["premium_info"]["premium"])
+                prem_sl = round(prem_entry * (1 - (premium_sl_pct / 100)), 2)
+                prem_t1 = round(prem_entry * 1.30, 2)  # Target 1: +30%
+                prem_t2 = round(prem_entry * 1.50, 2)  # Target 2: +50%
+                
+                prem_entry_str = f"₹{prem_entry:,.2f}"
+                prem_sl_str = f"₹{prem_sl:,.2f} (-{premium_sl_pct}%)"
+                prem_target_str = f"₹{prem_t1:,.2f} / ₹{prem_t2:,.2f} (+30% / +50%)"
+            else:
+                prem_entry_str = "N/A"
+                prem_sl_str = "N/A"
+                prem_target_str = "N/A"
+
             alert_msg = (
                 f"🚨 *AI TRADING SIGNAL: {data['symbol']}*\n\n"
                 f"• *Decision:* `{data['bias']}`\n"
-                f"• *Recommended Strike:* `{data['strike']}`\n"
-                f"• *Entry Price:* ₹{data['price']:,.2f}\n"
-                f"• *Stop Loss:* ₹{data['sl']:,.2f}\n"
-                f"• *Target 1:* ₹{data['target1']:,.2f}\n"
+                f"• *Recommended Strike:* `{data['strike']}`\n\n"
+                f"🎯 *OPTION PREMIUM LEVELS (Exact Trade Prices):*\n"
+                f"• *Option Entry Premium:* `{prem_entry_str}`\n"
+                f"• *Option Stop Loss:* `{prem_sl_str}`\n"
+                f"• *Option Target 1 / Target 2:* `{prem_target_str}`\n\n"
+                f"📍 *SPOT INDEX LEVELS:*\n"
+                f"• *Spot Entry Price:* ₹{data['price']:,.2f}\n"
+                f"• *Spot Stop Loss:* ₹{data['sl']:,.2f}\n"
+                f"• *Spot Targets:* ₹{data['target1']:,.2f} / ₹{data['target2']:,.2f}\n\n"
+                f"📊 *SIGNAL METRICS:*\n"
                 f"• *Risk-Reward Ratio:* `{data['rrr']}`\n"
                 f"• *Confidence Score:* `{data['score']}%`\n"
                 f"• *PCR:* `{data['pcr'] if data['pcr'] is not None else 'N/A'}`\n\n"
                 f"⏰ _Timestamp: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}_"
             )
-            st.text_area("Telegram Preview", value=alert_msg, height=160)
+            st.text_area("Telegram Preview", value=alert_msg, height=260)
             if st.button("🚀 Send Alert to Telegram"):
                 if send_telegram_alert(alert_msg):
                     st.success("✅ Signal broadcasted to Telegram successfully!")
