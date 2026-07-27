@@ -426,7 +426,7 @@ def is_expiry_today(expiry_str: str) -> bool:
         return False
 
 # =========================================================================
-# 7. CORE ANALYSIS ENGINE (UPDATED WITH SUPERTREND, RSI & SMC)
+# 7. CORE ANALYSIS ENGINE (RESILIENT YAHOO FETCHING)
 # =========================================================================
 def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain) -> str:
     if nse_chain and nse_chain.get("atm_strike"):
@@ -449,11 +449,19 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
 
     try:
         ticker = yf.Ticker(ticker_sym)
-        df_5m = ticker.history(period="7d", interval="5m")
         
-        # Weekend / Off-Market Fallback: Use 15m candles if 5m is empty
-        if df_5m.empty or len(df_5m) < 10:
-            df_5m = ticker.history(period="7d", interval="15m")
+        # Resilient multi-interval fetch (prevents Streamlit Cloud IP throttling errors)
+        df_5m = pd.DataFrame()
+        for interval in ["5m", "15m", "1h"]:
+            try:
+                df_5m = ticker.history(period="7d", interval=interval)
+                if not df_5m.empty and len(df_5m) >= 5:
+                    break
+            except Exception:
+                continue
+
+        if df_5m.empty:
+            df_5m = ticker.history(period="1mo", interval="1d")
 
         df_15m = ticker.history(period="10d", interval="15m")
         df_1h = ticker.history(period="1mo", interval="1h")
@@ -484,7 +492,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         if not current_atr or np.isnan(current_atr):
             current_atr = current_price * 0.003
 
-        # --- NEW INDICATORS: RSI & SUPERTREND & SMC FVG ---
+        # --- INDICATORS: RSI, SUPERTREND & SMC FVG ---
         df_5m['RSI'] = calculate_rsi(df_5m, 14)
         current_rsi = df_5m['RSI'].iloc[-1] if not df_5m['RSI'].empty else 50.0
 
@@ -588,7 +596,6 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
                 target1 = round(current_price - atr_mult_t1 * current_atr, 2)
                 target2 = round(current_price - atr_mult_t2 * current_atr, 2)
 
-            # --- CALCULATE RISK-TO-REWARD RATIO (RRR) ---
             risk_dist = abs(current_price - sl)
             reward_dist = abs(target1 - current_price)
             rrr = f"1 : {round(reward_dist / risk_dist, 2)}" if risk_dist > 0 else "N/A"
@@ -605,7 +612,6 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
                     premium_info["delta"] = leg.get("delta")
                     premium_info["theta_per_day"] = leg.get("theta")
                 
-                # Spot Breakeven level
                 strike_num = float(strike.split()[0]) if strike != "N/A" else current_price
                 breakeven = round(strike_num + prem, 2) if bias == "BUY CALL" else round(strike_num - prem, 2)
 
