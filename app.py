@@ -113,7 +113,7 @@ def send_telegram_alert(message: str) -> bool:
         return False
 
 # =========================================================================
-# 3. ROBUST YAHOO HTTP FETCH WITH CLOUDIP BYPASS
+# 3. ROBUST YAHOO HTTP FETCH WITH CLOUD IP BYPASS
 # =========================================================================
 def fetch_yahoo_candles(ticker_sym: str, interval="5m", range_pd="5d") -> pd.DataFrame:
     for base_url in ["https://query2.finance.yahoo.com", "https://query1.finance.yahoo.com"]:
@@ -147,7 +147,6 @@ def fetch_yahoo_candles(ticker_sym: str, interval="5m", range_pd="5d") -> pd.Dat
     return pd.DataFrame()
 
 def generate_fallback_candles(spot_price: float) -> pd.DataFrame:
-    """Generates synthetic intraday candles centered on the live spot price if Yahoo is blocked."""
     now = datetime.now(IST)
     dates = [now - timedelta(minutes=5 * i) for i in range(100, 0, -1)]
     np.random.seed(42)
@@ -246,8 +245,8 @@ def opening_range(df_today: pd.DataFrame, minutes: int = 15):
     if df_today.empty:
         return None, None
     idx = df_today.index
-    session_date = idx.tz_convert(IST).date()[0] if idx.tz is not None else idx.date[0]
-    day_open = datetime.combine(session_date, datetime.min.time(), tzinfo=IST).replace(hour=9, minute=15)
+    session_date = idx.tz_convert(IST).date if idx.tz is not None else idx.date
+    day_open = datetime.combine(session_date[0], datetime.min.time(), tzinfo=IST).replace(hour=9, minute=15)
     day_open_end = day_open + timedelta(minutes=minutes)
     mask = (idx.tz_convert(IST) >= day_open) & (idx.tz_convert(IST) < day_open_end) if idx.tz is not None else (idx >= day_open.replace(tzinfo=None)) & (idx < day_open_end.replace(tzinfo=None))
     orb_slice = df_today[mask]
@@ -471,7 +470,7 @@ def is_expiry_today(expiry_str: str) -> bool:
         return False
 
 # =========================================================================
-# 8. CORE ANALYSIS ENGINE (100% FAIL-PROOF)
+# 8. CORE ANALYSIS ENGINE
 # =========================================================================
 def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain) -> str:
     if nse_chain and nse_chain.get("atm_strike"):
@@ -501,12 +500,10 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
     if nse_chain is not None and groww_lot_size:
         nse_chain["lot_size"] = groww_lot_size
 
-    # 1. Try fetching live candles from Yahoo
     df_5m = fetch_yahoo_candles(ticker_sym, interval="5m", range_pd="5d")
     if df_5m.empty or len(df_5m) < 5:
         df_5m = fetch_yahoo_candles(ticker_sym, interval="15m", range_pd="7d")
 
-    # 2. If Yahoo candles fail, construct candles from Groww live spot price
     if df_5m.empty:
         live_spot = nse_chain.get("underlying") if nse_chain else (24500.0 if "NIFTY" in raw_sym else 52000.0)
         df_5m = generate_fallback_candles(live_spot)
@@ -549,7 +546,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
     fvg_active, fvg_desc = detect_fvg(df_5m)
 
     idx = df_5m.index
-    today_key = idx.tz_convert(IST).date() if idx.tz is not None else idx.date
+    today_key = idx.tz_convert(IST).date if idx.tz is not None else idx.date
     last_day = today_key[-1]
     try:
         df_today = df_5m[[d == last_day for d in today_key]]
