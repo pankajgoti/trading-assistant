@@ -470,7 +470,7 @@ def is_expiry_today(expiry_str: str) -> bool:
         return False
 
 # =========================================================================
-# 8. CORE ANALYSIS ENGINE
+# 8. CORE ANALYSIS ENGINE (WITH OPTION PREMIUM FALLBACK CALCULATOR)
 # =========================================================================
 def get_atm_display_strike(symbol: str, spot_price: float, bias: str, nse_chain) -> str:
     if nse_chain and nse_chain.get("atm_strike"):
@@ -636,19 +636,34 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         rrr = f"1 : {round(reward_dist / risk_dist, 2)}" if risk_dist > 0 else "N/A"
 
         leg = nse_chain["atm_ce"] if (nse_chain and bias == "BUY CALL") else (nse_chain["atm_pe"] if nse_chain else None)
-        data_source = nse_chain.get("source", "NSE live") if nse_chain else None
+        data_source = nse_chain.get("source", "NSE live") if nse_chain else "Estimated (Black-Scholes)"
+        
         if leg and leg.get("lastPrice"):
-            prem = leg.get("lastPrice")
-            premium_info = {
-                "source": data_source, "premium": prem, "iv": leg.get("impliedVolatility"),
-                "oi": leg.get("openInterest"), "chg_oi": leg.get("changeinOpenInterest"),
-            }
-            if leg.get("delta") is not None:
-                premium_info["delta"] = leg.get("delta")
-                premium_info["theta_per_day"] = leg.get("theta")
-            
-            strike_num = float(strike.split()[0]) if strike != "N/A" else current_price
-            breakeven = round(strike_num + prem, 2) if bias == "BUY CALL" else round(strike_num - prem, 2)
+            prem = float(leg.get("lastPrice"))
+            iv_val = leg.get("impliedVolatility")
+            oi_val = leg.get("openInterest")
+            chg_oi_val = leg.get("changeinOpenInterest")
+            delta_val = leg.get("delta")
+            theta_val = leg.get("theta")
+        else:
+            # ESTIMATOR FALLBACK: Calculates ATM premium when live option chain is unavailable
+            # ATM premium is approximately 0.5% to 0.8% of spot price for Near Expiry contracts
+            estimated_iv = 14.5
+            vix_mult = (vix_val / 100.0) if vix_val else 0.14
+            prem = round(current_price * vix_mult * math.sqrt(5 / 365.0) * 0.4, 2)
+            if prem < 10.0:
+                prem = round(current_price * 0.006, 2)
+            iv_val, oi_val, chg_oi_val = estimated_iv, "N/A", "N/A"
+            delta_val, theta_val = (0.50 if bias == "BUY CALL" else -0.50), round(-prem * 0.08, 2)
+
+        premium_info = {
+            "source": data_source, "premium": prem, "iv": iv_val,
+            "oi": oi_val, "chg_oi": chg_oi_val,
+            "delta": delta_val, "theta_per_day": theta_val
+        }
+        
+        strike_num = float(strike.split()[0]) if strike != "N/A" else current_price
+        breakeven = round(strike_num + prem, 2) if bias == "BUY CALL" else round(strike_num - prem, 2)
 
     return {
         "symbol": raw_sym, "price": current_price, "change_pct": price_change_pct,
@@ -764,7 +779,7 @@ with tab_screener:
                 g1.markdown(f"**Entry Premium**\n### ₹{pi['premium']}")
                 g2.markdown(f"**Spot Breakeven**\n### ₹{data['breakeven']}")
                 g3.markdown(f"**Implied Vol**\n### {pi.get('iv', 'N/A')}%")
-                if "delta" in pi:
+                if pi.get("delta") is not None:
                     g4.markdown(f"**Est. Delta**\n### {pi['delta']}")
                     g5.markdown(f"**Est. Theta/day**\n### ₹{pi['theta_per_day']}")
                 else:
@@ -811,14 +826,15 @@ with tab_screener:
         with act1:
             st.subheader("📲 Telegram Dispatcher")
             
-            # --- CALCULATE OPTION PREMIUM ENTRY, SL & TARGETS FOR TELEGRAM ---
+            # --- GUARANTEED OPTION PREMIUM ENTRY, SL & TARGETS FOR TELEGRAM ---
             if data['bias'] != "NEUTRAL / NO TRADE" and data.get("premium_info") and data["premium_info"].get("premium"):
                 prem_entry = float(data["premium_info"]["premium"])
                 prem_sl = round(prem_entry * (1 - (premium_sl_pct / 100)), 2)
                 prem_t1 = round(prem_entry * 1.30, 2)  # Target 1: +30%
                 prem_t2 = round(prem_entry * 1.50, 2)  # Target 2: +50%
                 
-                prem_entry_str = f"₹{prem_entry:,.2f}"
+                src_tag = f" ({data['premium_info'].get('source', '')})" if data['premium_info'].get('source') else ""
+                prem_entry_str = f"₹{prem_entry:,.2f}{src_tag}"
                 prem_sl_str = f"₹{prem_sl:,.2f} (-{premium_sl_pct}%)"
                 prem_target_str = f"₹{prem_t1:,.2f} / ₹{prem_t2:,.2f} (+30% / +50%)"
             else:
