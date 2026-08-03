@@ -8,9 +8,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
+
+# Safely handle Plotly import
+try:
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -811,6 +817,12 @@ def render_candlestick_chart(df: pd.DataFrame, symbol: str, orb_high=None, orb_l
     if df.empty:
         return None
     
+    # Fallback if Plotly is not installed yet
+    if not HAS_PLOTLY:
+        st.info("💡 Interactive Candlestick chart requires `plotly` in requirements.txt. Showing standard price chart:")
+        st.line_chart(df['Close'].tail(80))
+        return None
+
     df_chart = df.tail(80).copy()
     
     fig = make_subplots(
