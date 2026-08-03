@@ -8,11 +8,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# --- PAGE CONFIGURATION ---
+# =========================================================================
+# PAGE CONFIGURATION
+# =========================================================================
 st.set_page_config(
     page_title="AI Trading Assistant V5 Pro",
     page_icon="⚡",
@@ -20,19 +24,147 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CUSTOM CSS STYLING ---
+# =========================================================================
+# CUSTOM CSS DASHBOARD STYLING
+# =========================================================================
 st.markdown("""
 <style>
-    .buy-call { color: #00E676; font-size: 28px; font-weight: bold; }
-    .buy-put { color: #FF5252; font-size: 28px; font-weight: bold; }
-    .neutral { color: #FFD600; font-size: 28px; font-weight: bold; }
-    .warn-box {
-        background-color: #3A2A00; border: 1px solid #FFD600;
-        padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
+    /* Dark Mode App Background */
+    .stApp {
+        background-color: #0E1117;
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
     }
-    .danger-box {
-        background-color: #3A0000; border: 1px solid #FF5252;
-        padding: 10px 14px; border-radius: 8px; margin-bottom: 10px;
+    
+    /* Card Container */
+    .card {
+        background: #161B22;
+        border: 1px solid #30363D;
+        border-radius: 12px;
+        padding: 18px 20px;
+        margin-bottom: 12px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    }
+    
+    .card-title {
+        font-size: 12px;
+        font-weight: 600;
+        color: #8B949E;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+        margin-bottom: 6px;
+    }
+    
+    .card-value {
+        font-size: 24px;
+        font-weight: 700;
+        color: #F0F6FC;
+    }
+    
+    .card-sub {
+        font-size: 12px;
+        color: #8B949E;
+        margin-top: 4px;
+    }
+    
+    /* Signal Badges */
+    .badge-call {
+        background: rgba(0, 230, 118, 0.12);
+        border: 1px solid #00E676;
+        color: #00E676;
+        padding: 10px 18px;
+        border-radius: 10px;
+        font-weight: 800;
+        font-size: 24px;
+        text-align: center;
+        letter-spacing: 0.5px;
+        box-shadow: 0 0 15px rgba(0, 230, 118, 0.2);
+    }
+    
+    .badge-put {
+        background: rgba(255, 82, 82, 0.12);
+        border: 1px solid #FF5252;
+        color: #FF5252;
+        padding: 10px 18px;
+        border-radius: 10px;
+        font-weight: 800;
+        font-size: 24px;
+        text-align: center;
+        letter-spacing: 0.5px;
+        box-shadow: 0 0 15px rgba(255, 82, 82, 0.2);
+    }
+    
+    .badge-neutral {
+        background: rgba(255, 214, 0, 0.12);
+        border: 1px solid #FFD600;
+        color: #FFD600;
+        padding: 10px 18px;
+        border-radius: 10px;
+        font-weight: 800;
+        font-size: 20px;
+        text-align: center;
+        letter-spacing: 0.5px;
+    }
+
+    /* Alert Boxes */
+    .status-warn {
+        background: rgba(255, 214, 0, 0.08);
+        border-left: 4px solid #FFD600;
+        padding: 12px 16px;
+        border-radius: 8px;
+        margin-bottom: 14px;
+        color: #F0F6FC;
+        font-size: 14px;
+    }
+    
+    .status-danger {
+        background: rgba(255, 82, 82, 0.08);
+        border-left: 4px solid #FF5252;
+        padding: 12px 16px;
+        border-radius: 8px;
+        margin-bottom: 14px;
+        color: #F0F6FC;
+        font-size: 14px;
+    }
+
+    /* Checklist Badge */
+    .check-pass {
+        background: rgba(0, 230, 118, 0.06);
+        border: 1px solid rgba(0, 230, 118, 0.3);
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        font-size: 13.5px;
+        color: #E6EDF3;
+    }
+    
+    .check-fail {
+        background: rgba(255, 82, 82, 0.06);
+        border: 1px solid rgba(255, 82, 82, 0.3);
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        font-size: 13.5px;
+        color: #E6EDF3;
+    }
+    
+    /* Streamlit Tabs Customization */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 12px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background-color: #161B22;
+        border: 1px solid #30363D;
+        border-radius: 8px;
+        padding: 8px 16px;
+        color: #8B949E;
+        font-weight: 600;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: #1F242C !important;
+        border-color: #58A6FF !important;
+        color: #58A6FF !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -560,7 +692,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
     pcr = nse_chain["pcr"] if nse_chain and nse_chain["pcr"] is not None else None
     expiry_today = is_expiry_today(nse_chain["expiry"]) if nse_chain else False
 
-    # --- CONFIDENCE SCORE CALCULATION (max 100) ---
+    # --- CONFIDENCE SCORE CALCULATION ---
     score = 0
     checks = {}
 
@@ -646,10 +778,8 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
             delta_val = leg.get("delta")
             theta_val = leg.get("theta")
         else:
-            # DELTA SCALED ESTIMATOR: Estimates realistic ATM premium based on ATR & Spot distance
             strike_num = float(strike.split()[0]) if strike != "N/A" else current_price
             dist_from_strike = abs(current_price - strike_num)
-            # Standard ATM Delta ~ 0.50
             prem = round(dist_from_strike + (current_atr * 3.5), 2)
             iv_val, oi_val, chg_oi_val = 14.5, "N/A", "N/A"
             delta_val, theta_val = (0.50 if bias == "BUY CALL" else -0.50), round(-prem * 0.08, 2)
@@ -672,219 +802,105 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         "trends": {"1D": trend_1d, "1H": trend_1h, "15M": trend_15m, "5M": trend_5m},
         "orb_high": orb_high, "orb_low": orb_low,
         "nse_chain": nse_chain, "expiry_today": expiry_today, "expiry_cutoff": expiry_cutoff,
-        "vix_block": vix_block, "premium_info": premium_info,
+        "vix_block": vix_block, "premium_info": premium_info, "df_5m": df_5m
     }
+
+# =========================================================================
+# PLOTLY CANDLESTICK CHART BUILDER
+# =========================================================================
+def render_candlestick_chart(df: pd.DataFrame, symbol: str, orb_high=None, orb_low=None):
+    if df.empty:
+        return None
+    
+    df_chart = df.tail(80).copy()
+    
+    fig = make_subplots(
+        rows=2, cols=1, 
+        shared_xaxes=True, 
+        vertical_spacing=0.03, 
+        row_heights=[0.75, 0.25]
+    )
+
+    # Candlesticks
+    fig.add_trace(go.Candlestick(
+        x=df_chart.index,
+        open=df_chart['Open'],
+        high=df_chart['High'],
+        low=df_chart['Low'],
+        close=df_chart['Close'],
+        name="Price",
+        increasing_line_color="#00E676",
+        decreasing_line_color="#FF5252"
+    ), row=1, col=1)
+
+    # VWAP Line
+    if 'VWAP' in df_chart.columns:
+        fig.add_trace(go.Scatter(
+            x=df_chart.index, y=df_chart['VWAP'],
+            mode='lines', name='Session VWAP',
+            line=dict(color='#00E5FF', width=1.5, dash='dot')
+        ), row=1, col=1)
+
+    # Supertrend Line
+    if 'Supertrend' in df_chart.columns:
+        fig.add_trace(go.Scatter(
+            x=df_chart.index, y=df_chart['Supertrend'],
+            mode='lines', name='Supertrend',
+            line=dict(color='#FF9100', width=1.5)
+        ), row=1, col=1)
+
+    # ORB High / Low
+    if orb_high:
+        fig.add_hline(y=orb_high, line_dash="dash", line_color="#00E676", annotation_text="ORB High", row=1, col=1)
+    if orb_low:
+        fig.add_hline(y=orb_low, line_dash="dash", line_color="#FF5252", annotation_text="ORB Low", row=1, col=1)
+
+    # Volume Bars
+    colors = ['#00E676' if c >= o else '#FF5252' for c, o in zip(df_chart['Close'], df_chart['Open'])]
+    fig.add_trace(go.Bar(
+        x=df_chart.index, y=df_chart['Volume'],
+        name="Volume",
+        marker_color=colors,
+        opacity=0.6
+    ), row=2, col=1)
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=450,
+        margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_rangeslider_visible=False,
+        paper_bgcolor="#161B22",
+        plot_bgcolor="#161B22",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        font=dict(family="Inter, sans-serif", color="#8B949E")
+    )
+    
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#21262D')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='#21262D')
+    
+    return fig
 
 # =========================================================================
 # STREAMLIT DASHBOARD UI
 # =========================================================================
-st.title("⚡ AI Trading Assistant V5 Pro")
-st.markdown("Session-VWAP • Supertrend • RSI Momentum • SMC FVG • Live Groww Option Chain • ATR Risk")
 
-is_open, status_label = market_status()
-if not is_open:
-    st.markdown(f'<div class="warn-box">🕒 <b>{status_label}</b></div>', unsafe_allow_html=True)
+# --- SIDEBAR CONFIGURATION ---
+st.sidebar.markdown("### ⚙️ Control Panel")
+user_symbol = st.sidebar.text_input("Symbol Ticker", value="NIFTY").upper().strip()
 
-if not get_groww_headers():
-    st.markdown(
-        '<div class="warn-box">🔌 <b>Groww API not connected</b> — add <code>GROWW_ACCESS_TOKEN</code> '
-        'in Streamlit Secrets for live option-chain data (real PCR, IV, Greeks, and exact lot sizes).</div>',
-        unsafe_allow_html=True
-    )
-
-vix_val, vix_regime = get_india_vix()
-vix_col1, vix_col2 = st.columns([1, 3])
-with vix_col1:
-    st.metric("India VIX", vix_val if vix_val is not None else "N/A")
-with vix_col2:
-    st.markdown(f"**Volatility Regime:** {vix_regime}")
-
-st.sidebar.header("⚙️ Configuration")
-user_symbol = st.sidebar.text_input("Symbol (e.g. NIFTY, SENSEX, RELIANCE)", value="NIFTY").upper().strip()
-
-st.sidebar.subheader("🔄 Continuous Market Auto-Refresh")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔄 Auto-Refresh Engine")
 enable_autorefresh = st.sidebar.checkbox("Enable Auto-Refresh", value=False)
-refresh_interval = st.sidebar.slider("Refresh Timer (Seconds)", min_value=15, max_value=120, value=30)
+refresh_interval = st.sidebar.slider("Interval (Seconds)", min_value=15, max_value=120, value=30)
 if enable_autorefresh:
     st_autorefresh(interval=refresh_interval * 1000, key="market_auto_refresh")
 
-st.sidebar.divider()
-st.sidebar.subheader("💰 Position Sizing (Option Buying)")
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 💰 Position Sizing")
 _instruments_df = fetch_groww_instruments()
 _live_expiry, _live_lot = get_expiry_and_lotsize(user_symbol, _instruments_df)
 if _live_lot:
-    st.sidebar.caption(f"✅ Lot size auto-fetched live from Groww instrument master (expiry {_live_expiry}).")
+    st.sidebar.caption(f"✅ Lot size fetched live: **{_live_lot}** (Expiry: {_live_expiry})")
     default_lot = _live_lot
 else:
-    st.sidebar.caption("⚠️ Live lot size unavailable — using pre-filled estimate.")
-    default_lot = DEFAULT_LOT_SIZES.get(user_symbol, 1)
-
-capital = st.sidebar.number_input("Trading Capital (₹)", min_value=1000, value=100000, step=1000)
-risk_pct = st.sidebar.slider("Max Risk per Trade (%)", 0.5, 5.0, 1.5, 0.5)
-lot_size = st.sidebar.number_input("Lot Size (auto-filled, override if needed)", min_value=1, value=default_lot, step=1)
-premium_sl_pct = st.sidebar.slider("Premium Stop-Loss (%)", 10, 50, 30, 5)
-
-tab_screener, tab_journal = st.tabs(["📊 Live Market Signals", "📓 Trade Journal"])
-
-with tab_screener:
-    data = analyze_market(user_symbol, vix_val, orb_confirm_pct=0.0)
-
-    if data:
-        if data["expiry_today"]:
-            st.markdown('<div class="warn-box">📅 <b>Today is Expiry Day</b> — fresh option buying auto-blocked after 2:30 PM IST.</div>', unsafe_allow_html=True)
-        if data["vix_block"]:
-            st.markdown('<div class="danger-box">🌪️ <b>India VIX is HIGH</b> — fresh naked option buying is suppressed.</div>', unsafe_allow_html=True)
-
-        col1, col2, col3, col4 = st.columns([1.5, 1.2, 1.2, 1.5])
-        with col1:
-            st.markdown("**Signal Bias**")
-            if data["bias"] == "BUY CALL":
-                st.markdown(f'<div class="buy-call">🟢 {data["bias"]}</div>', unsafe_allow_html=True)
-            elif data["bias"] == "BUY PUT":
-                st.markdown(f'<div class="buy-put">🔴 {data["bias"]}</div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="neutral">🟡 {data["bias"]}</div>', unsafe_allow_html=True)
-        with col2:
-            st.markdown("**Confidence Score**")
-            st.progress(data["score"] / 100)
-            st.markdown(f"### **{data['score']}%**")
-        with col3:
-            st.markdown("**Put-Call Ratio (PCR)**")
-            if data["pcr"] is None:
-                st.markdown("### ⚪ N/A")
-            else:
-                pcr_icon = "🟢" if data["pcr"] >= 1.0 else "🔴"
-                st.markdown(f"### {pcr_icon} **{data['pcr']}**")
-        with col4:
-            st.markdown("**Spot Price**")
-            st.metric(label=f"{data['symbol']}", value=f"₹{data['price']:,.2f}", delta=f"{data['change_pct']:+.2f}%")
-
-        st.divider()
-
-        if data["bias"] != "NEUTRAL / NO TRADE":
-            st.subheader("🎯 Trade Execution Parameters")
-            p1, p2, p3, p4, p5 = st.columns(5)
-            p1.markdown(f"**Recommended Strike**\n### `{data['strike']}`")
-            p2.markdown(f"**Entry Spot Price**\n### ₹{data['price']:,.2f}")
-            p3.markdown(f"**Stop Loss (SL)**\n### ₹{data['sl']:,.2f}")
-            p4.markdown(f"**Target 1 / Target 2**\n### ₹{data['target1']:,.2f} / ₹{data['target2']:,.2f}")
-            p5.markdown(f"**Risk-Reward Ratio (RRR)**\n### `{data['rrr']}`")
-
-            if data["premium_info"]:
-                pi = data["premium_info"]
-                st.subheader("💊 Option Premium & Breakeven Analytics")
-                g1, g2, g3, g4, g5 = st.columns(5)
-                g1.markdown(f"**Entry Premium**\n### ₹{pi['premium']}")
-                g2.markdown(f"**Spot Breakeven**\n### ₹{data['breakeven']}")
-                g3.markdown(f"**Implied Vol**\n### {pi.get('iv', 'N/A')}%")
-                if pi.get("delta") is not None:
-                    g4.markdown(f"**Est. Delta**\n### {pi['delta']}")
-                    g5.markdown(f"**Est. Theta/day**\n### ₹{pi['theta_per_day']}")
-                else:
-                    g4.markdown(f"**OI**\n### {pi.get('oi', 'N/A')}")
-                    g5.markdown(f"**Chg in OI**\n### {pi.get('chg_oi', 'N/A')}")
-
-                premium_sl_val = round(pi['premium'] * (premium_sl_pct / 100), 2)
-                max_loss_per_lot = premium_sl_val * lot_size
-                risk_amount = capital * (risk_pct / 100)
-                suggested_lots = int(risk_amount // max_loss_per_lot) if max_loss_per_lot > 0 else 0
-
-                st.subheader("📐 Suggested Position Size")
-                s1, s2, s3 = st.columns(3)
-                s1.markdown(f"**Risk Budget**\n### ₹{risk_amount:,.0f}")
-                s2.markdown(f"**Max Loss / Lot**\n### ₹{max_loss_per_lot:,.0f}")
-                s3.markdown(f"**Suggested Lots**\n### {suggested_lots}")
-
-            st.divider()
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Session VWAP", f"₹{data['vwap']:,.2f}")
-        m2.metric("Supertrend (7,3)", f"₹{data['supertrend']:,.2f}")
-        m3.metric("RSI (14)", f"{data['rsi']:.1f}")
-        m4.metric("ATR (14, 5m)", f"₹{data['atr']:,.2f}")
-        m5.metric("SMC FVG Imbalance", "🟢 Bullish" if "Bullish" in data["fvg_desc"] else ("🔴 Bearish" if "Bearish" in data["fvg_desc"] else "⚪ None"))
-
-        st.divider()
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.subheader("📊 Multi-Timeframe Alignment")
-            t_df = pd.DataFrame([data["trends"]]).T
-            t_df.columns = ["Direction"]
-            st.table(t_df)
-        with c2:
-            st.subheader("🎯 System Checklist")
-            for check, (passed, desc) in data["checks"].items():
-                icon = "🟢" if passed else "🔴"
-                st.write(f"{icon} **{check}**: {desc}")
-
-        st.divider()
-
-        act1, act2 = st.columns(2)
-        with act1:
-            st.subheader("📲 Telegram Dispatcher")
-            
-            if data['bias'] != "NEUTRAL / NO TRADE" and data.get("premium_info") and data["premium_info"].get("premium"):
-                prem_entry = float(data["premium_info"]["premium"])
-                prem_sl = round(prem_entry * (1 - (premium_sl_pct / 100)), 2)
-                prem_t1 = round(prem_entry * 1.30, 2)  # Target 1: +30%
-                prem_t2 = round(prem_entry * 1.50, 2)  # Target 2: +50%
-                
-                src_type = data['premium_info'].get('source', '')
-                src_tag = f" ({src_type})" if src_type else ""
-                prem_entry_str = f"₹{prem_entry:,.2f}{src_tag}"
-                prem_sl_str = f"₹{prem_sl:,.2f} (-{premium_sl_pct}%)"
-                prem_target_str = f"₹{prem_t1:,.2f} / ₹{prem_t2:,.2f} (+30% / +50%)"
-            else:
-                prem_entry_str = "N/A"
-                prem_sl_str = "N/A"
-                prem_target_str = "N/A"
-
-            alert_msg = (
-                f"🚨 *AI TRADING SIGNAL: {data['symbol']}*\n\n"
-                f"• *Decision:* `{data['bias']}`\n"
-                f"• *Recommended Strike:* `{data['strike']}`\n\n"
-                f"🎯 *OPTION PREMIUM LEVELS (Exact Trade Prices):*\n"
-                f"• *Option Entry Premium:* `{prem_entry_str}`\n"
-                f"• *Option Stop Loss:* `{prem_sl_str}`\n"
-                f"• *Option Target 1 / Target 2:* `{prem_target_str}`\n\n"
-                f"📍 *SPOT INDEX LEVELS:*\n"
-                f"• *Spot Entry Price:* ₹{data['price']:,.2f}\n"
-                f"• *Spot Stop Loss:* ₹{data['sl']:,.2f}\n"
-                f"• *Spot Targets:* ₹{data['target1']:,.2f} / ₹{data['target2']:,.2f}\n\n"
-                f"📊 *SIGNAL METRICS:*\n"
-                f"• *Risk-Reward Ratio:* `{data['rrr']}`\n"
-                f"• *Confidence Score:* `{data['score']}%`\n"
-                f"• *PCR:* `{data['pcr'] if data['pcr'] is not None else 'N/A'}`\n\n"
-                f"⏰ _Timestamp: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}_"
-            )
-            st.text_area("Telegram Preview", value=alert_msg, height=260)
-            if st.button("🚀 Send Alert to Telegram"):
-                if send_telegram_alert(alert_msg):
-                    st.success("✅ Signal broadcasted to Telegram successfully!")
-
-        with act2:
-            st.subheader("📓 Journal Entry Logging")
-            notes = st.text_input("Custom Notes", value=f"{data['bias']} setup logged for {data['symbol']}")
-            if st.button("💾 Log Trade to Database"):
-                log_trade(
-                    symbol=data['symbol'], price=data['price'], bias=data['bias'], strike=data['strike'],
-                    entry=data['price'], sl=data['sl'], target=data['target1'], score=data['score'],
-                    pcr=data['pcr'] if data['pcr'] is not None else -1, vix=vix_val if vix_val is not None else -1,
-                    notes=notes
-                )
-                st.success(f"✅ Trade recorded in `{DB_NAME}`!")
-    else:
-        st.warning(f"Unable to fetch data for '{user_symbol}'. Try NIFTY, BANKNIFTY, SENSEX, or a stock ticker like RELIANCE, TCS, INFY.")
-
-with tab_journal:
-    st.subheader("📓 Trade Journal History")
-    journal_df = get_journal_data()
-    if not journal_df.empty:
-        st.dataframe(journal_df, use_container_width=True)
-        csv = journal_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Export Journal as CSV", data=csv,
-                            file_name=f"trade_journal_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv")
-    else:
-        st.info("No trade entries logged yet.")
+    st.sidebar.caption("⚠️ Live
