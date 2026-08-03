@@ -233,7 +233,7 @@ def send_telegram_alert(message: str) -> bool:
     bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
     if not bot_token or not chat_id:
-        st.error("⚠️ Telegram credentials missing in Streamlit Secrets!")
+        st.error("Telegram credentials missing in Streamlit Secrets!")
         return False
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
@@ -305,9 +305,9 @@ def market_status():
     open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
     close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
     if now < open_t:
-        return False, "Market Closed (Pre-Open) — showing last session data"
+        return False, "Market Closed (Pre-Open) - showing last session data"
     if now > close_t:
-        return False, "Market Closed — showing last session data"
+        return False, "Market Closed - showing last session data"
     return True, "Market Open"
 
 # =========================================================================
@@ -409,7 +409,7 @@ def get_india_vix():
         return 13.5, "NORMAL (Fallback)"
 
 # =========================================================================
-# 7a. GROWW TRADE API — OFFICIAL OPTION CHAIN
+# 7a. GROWW TRADE API - OFFICIAL OPTION CHAIN
 # =========================================================================
 GROWW_INSTRUMENTS_URL = "https://growwapi-assets.groww.in/instruments/instrument.csv"
 
@@ -518,11 +518,10 @@ def fetch_groww_option_chain(raw_sym: str, exchange: str, expiry_date: str):
         return None
 
 # =========================================================================
-# 7b. NSE SCRAPER — FALLBACK ONLY
+# 7b. NSE SCRAPER - FALLBACK ONLY
 # =========================================================================
 NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "*/*",
     "Referer": "https://www.nseindia.com/option-chain",
@@ -731,7 +730,7 @@ def analyze_market(symbol: str, vix_val, orb_confirm_pct: float):
         checks["Opening Range Breakout"] = (False, "No confirmed ORB breakout")
 
     if pcr is None:
-        checks["Option Chain (PCR)"] = (False, "Option data unavailable — not scored")
+        checks["Option Chain (PCR)"] = (False, "Option data unavailable - not scored")
     elif (aligned_bullish and pcr >= 1.0) or (aligned_bearish and pcr < 1.0):
         score += 20
         checks["Option Chain (PCR)"] = (True, f"PCR = {pcr}")
@@ -885,22 +884,269 @@ def render_candlestick_chart(df: pd.DataFrame, symbol: str, orb_high=None, orb_l
 # =========================================================================
 
 # --- SIDEBAR CONFIGURATION ---
-st.sidebar.markdown("### ⚙️ Control Panel")
+st.sidebar.markdown("### Control Panel")
 user_symbol = st.sidebar.text_input("Symbol Ticker", value="NIFTY").upper().strip()
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🔄 Auto-Refresh Engine")
+st.sidebar.markdown("### Auto-Refresh Engine")
 enable_autorefresh = st.sidebar.checkbox("Enable Auto-Refresh", value=False)
 refresh_interval = st.sidebar.slider("Interval (Seconds)", min_value=15, max_value=120, value=30)
 if enable_autorefresh:
     st_autorefresh(interval=refresh_interval * 1000, key="market_auto_refresh")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 💰 Position Sizing")
+st.sidebar.markdown("### Position Sizing")
 _instruments_df = fetch_groww_instruments()
 _live_expiry, _live_lot = get_expiry_and_lotsize(user_symbol, _instruments_df)
 if _live_lot:
-    st.sidebar.caption(f"✅ Lot size fetched live: **{_live_lot}** (Expiry: {_live_expiry})")
+    st.sidebar.caption(f"Lot size fetched live: {_live_lot} (Expiry: {_live_expiry})")
     default_lot = _live_lot
 else:
-    st.sidebar.caption("⚠️ Live
+    st.sidebar.caption("Live lot size fallback active.")
+    default_lot = DEFAULT_LOT_SIZES.get(user_symbol, 1)
+
+capital = st.sidebar.number_input("Trading Capital (INR)", min_value=1000, value=100000, step=1000)
+risk_pct = st.sidebar.slider("Risk per Trade (%)", 0.5, 5.0, 1.5, 0.5)
+lot_size = st.sidebar.number_input("Lot Size", min_value=1, value=default_lot, step=1)
+premium_sl_pct = st.sidebar.slider("Premium Stop-Loss (%)", 10, 50, 30, 5)
+
+# --- HEADER SECTION ---
+vix_val, vix_regime = get_india_vix()
+is_open, status_label = market_status()
+
+header_col1, header_col2 = st.columns([3, 1])
+with header_col1:
+    st.title("AI TRADING ASSISTANT PRO")
+    st.caption("Institutional Market Screener | Session VWAP | Supertrend | RSI Momentum | SMC FVG | Option Chain")
+
+with header_col2:
+    st.markdown(f"""
+    <div class="card" style="padding:12px; text-align:right;">
+        <div class="card-title">Market Status</div>
+        <div style="font-weight:700; color:{'#00E676' if is_open else '#FFD600'};">{status_label}</div>
+        <div class="card-sub">India VIX: <b>{vix_val}</b> ({vix_regime})</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+if not is_open:
+    st.markdown(f'<div class="status-warn"><b>Market Notice:</b> {status_label}</div>', unsafe_allow_html=True)
+
+if not get_groww_headers():
+    st.markdown(
+        '<div class="status-warn"><b>Groww API Notice:</b> Add GROWW_ACCESS_TOKEN in Streamlit Secrets for live option chain metrics.</div>',
+        unsafe_allow_html=True
+    )
+
+tab_screener, tab_journal = st.tabs(["Live Screener & Signal", "Trade Journal"])
+
+with tab_screener:
+    data = analyze_market(user_symbol, vix_val, orb_confirm_pct=0.0)
+
+    if data:
+        if data["expiry_today"]:
+            st.markdown('<div class="status-warn"><b>Expiry Day Notice:</b> Option buying auto-restricted after 2:30 PM IST.</div>', unsafe_allow_html=True)
+        if data["vix_block"]:
+            st.markdown('<div class="status-danger"><b>High Volatility Warning:</b> India VIX is elevated (>=22). Fresh option buying paused.</div>', unsafe_allow_html=True)
+
+        # --- HERO METRIC CARDS ---
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+
+        with kpi1:
+            delta_color = "#00E676" if data['change_pct'] >= 0 else "#FF5252"
+            st.markdown(f"""
+            <div class="card">
+                <div class="card-title">{data['symbol']} Spot Price</div>
+                <div class="card-value">INR {data['price']:,.2f}</div>
+                <div class="card-sub" style="color:{delta_color}; font-weight:700;">{data['change_pct']:+.2f}% Day Change</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with kpi2:
+            bias_class = "badge-call" if data["bias"] == "BUY CALL" else ("badge-put" if data["bias"] == "BUY PUT" else "badge-neutral")
+            st.markdown(f"""
+            <div class="card" style="text-align:center;">
+                <div class="card-title">AI Decision Bias</div>
+                <div class="{bias_class}">{data["bias"]}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with kpi3:
+            st.markdown(f"""
+            <div class="card">
+                <div class="card-title">Confidence Score</div>
+                <div class="card-value">{data['score']}%</div>
+                <div class="card-sub">Quantitative Matrix Match</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with kpi4:
+            pcr_str = f"{data['pcr']}" if data['pcr'] is not None else "N/A"
+            pcr_color = "#00E676" if data['pcr'] and data['pcr'] >= 1.0 else "#FF5252"
+            st.markdown(f"""
+            <div class="card">
+                <div class="card-title">Put-Call Ratio (PCR)</div>
+                <div class="card-value" style="color:{pcr_color};">{pcr_str}</div>
+                <div class="card-sub">Sentiment Balance</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # --- TRADE EXECUTION PARAMETERS CARD ---
+        if data["bias"] != "NEUTRAL / NO TRADE":
+            st.markdown("### Trade Execution Matrix")
+            p1, p2, p3, p4, p5 = st.columns(5)
+            
+            p1.markdown(f"""<div class="card"><div class="card-title">Strike Option</div><div class="card-value" style="font-size:20px; color:#58A6FF;">{data['strike']}</div></div>""", unsafe_allow_html=True)
+            p2.markdown(f"""<div class="card"><div class="card-title">Spot Entry</div><div class="card-value" style="font-size:20px;">INR {data['price']:,.2f}</div></div>""", unsafe_allow_html=True)
+            p3.markdown(f"""<div class="card"><div class="card-title">Spot Stop Loss</div><div class="card-value" style="font-size:20px; color:#FF5252;">INR {data['sl']:,.2f}</div></div>""", unsafe_allow_html=True)
+            p4.markdown(f"""<div class="card"><div class="card-title">Targets (T1 / T2)</div><div class="card-value" style="font-size:18px; color:#00E676;">INR {data['target1']:,.0f} / {data['target2']:,.0f}</div></div>""", unsafe_allow_html=True)
+            p5.markdown(f"""<div class="card"><div class="card-title">Risk-Reward</div><div class="card-value" style="font-size:20px;">{data['rrr']}</div></div>""", unsafe_allow_html=True)
+
+            if data["premium_info"]:
+                pi = data["premium_info"]
+                st.markdown("##### Option Analytics & Position Sizing")
+                g1, g2, g3, g4, g5 = st.columns(5)
+                
+                g1.markdown(f"""<div class="card"><div class="card-title">Entry Premium</div><div class="card-value" style="font-size:20px;">INR {pi['premium']}</div></div>""", unsafe_allow_html=True)
+                g2.markdown(f"""<div class="card"><div class="card-title">Breakeven Spot</div><div class="card-value" style="font-size:20px;">INR {data['breakeven']}</div></div>""", unsafe_allow_html=True)
+                g3.markdown(f"""<div class="card"><div class="card-title">Implied Vol (IV)</div><div class="card-value" style="font-size:20px;">{pi.get('iv', 'N/A')}%</div></div>""", unsafe_allow_html=True)
+                g4.markdown(f"""<div class="card"><div class="card-title">Est. Delta</div><div class="card-value" style="font-size:20px;">{pi.get('delta', 'N/A')}</div></div>""", unsafe_allow_html=True)
+                g5.markdown(f"""<div class="card"><div class="card-title">Est. Theta / Day</div><div class="card-value" style="font-size:20px; color:#FF5252;">INR {pi.get('theta_per_day', 'N/A')}</div></div>""", unsafe_allow_html=True)
+
+                premium_sl_val = round(pi['premium'] * (premium_sl_pct / 100), 2)
+                max_loss_per_lot = premium_sl_val * lot_size
+                risk_amount = capital * (risk_pct / 100)
+                suggested_lots = int(risk_amount // max_loss_per_lot) if max_loss_per_lot > 0 else 0
+
+                s1, s2, s3 = st.columns(3)
+                s1.markdown(f"""<div class="card"><div class="card-title">Risk Capital Budget</div><div class="card-value">INR {risk_amount:,.0f}</div></div>""", unsafe_allow_html=True)
+                s2.markdown(f"""<div class="card"><div class="card-title">Max Loss Per Lot</div><div class="card-value" style="color:#FF5252;">INR {max_loss_per_lot:,.0f}</div></div>""", unsafe_allow_html=True)
+                s3.markdown(f"""<div class="card"><div class="card-title">Recommended Lots</div><div class="card-value" style="color:#00E676;">{suggested_lots} Lots</div></div>""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # --- CHART & TECHNICAL METRICS HUB ---
+        chart_col, tech_col = st.columns([2.5, 1])
+
+        with chart_col:
+            st.markdown("### Price Action & Technical Overlay")
+            fig = render_candlestick_chart(data["df_5m"], data["symbol"], data["orb_high"], data["orb_low"])
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+
+        with tech_col:
+            st.markdown("### Live Indicators")
+            st.markdown(f"""
+            <div class="card">
+                <div class="card-title">Session VWAP</div>
+                <div class="card-value">INR {data['vwap']:,.2f}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Supertrend (7, 3.0)</div>
+                <div class="card-value">INR {data['supertrend']:,.2f}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">RSI (14)</div>
+                <div class="card-value">{data['rsi']:.1f}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">ATR Volatility (14)</div>
+                <div class="card-value">INR {data['atr']:,.2f}</div>
+            </div>
+            <div class="card">
+                <div class="card-title">SMC Imbalance (FVG)</div>
+                <div class="card-value" style="font-size:16px;">{data['fvg_desc']}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # --- TIMEFRAMES & CHECKLIST ---
+        col_mtf, col_check = st.columns(2)
+
+        with col_mtf:
+            st.markdown("### Multi-Timeframe Alignment")
+            mtf_df = pd.DataFrame([data["trends"]]).T
+            mtf_df.columns = ["Trend Direction"]
+            st.dataframe(mtf_df, use_container_width=True)
+
+        with col_check:
+            st.markdown("### Quantitative System Checklist")
+            for check, (passed, desc) in data["checks"].items():
+                badge_style = "check-pass" if passed else "check-fail"
+                status_tag = "[PASS]" if passed else "[FAIL]"
+                st.markdown(f"""
+                <div class="{badge_style}">
+                    <b>{status_tag} {check}:</b> {desc}
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # --- TELEGRAM & LOGGING ---
+        act1, act2 = st.columns(2)
+        
+        with act1:
+            st.markdown("### Telegram Dispatcher")
+            if data['bias'] != "NEUTRAL / NO TRADE" and data.get("premium_info") and data["premium_info"].get("premium"):
+                prem_entry = float(data["premium_info"]["premium"])
+                prem_sl = round(prem_entry * (1 - (premium_sl_pct / 100)), 2)
+                prem_t1 = round(prem_entry * 1.30, 2)
+                prem_t2 = round(prem_entry * 1.50, 2)
+                
+                src_type = data['premium_info'].get('source', '')
+                src_tag = f" ({src_type})" if src_type else ""
+                prem_entry_str = f"INR {prem_entry:,.2f}{src_tag}"
+                prem_sl_str = f"INR {prem_sl:,.2f} (-{premium_sl_pct}%)"
+                prem_target_str = f"INR {prem_t1:,.2f} / INR {prem_t2:,.2f} (+30% / +50%)"
+            else:
+                prem_entry_str, prem_sl_str, prem_target_str = "N/A", "N/A", "N/A"
+
+            alert_msg = (
+                f"AI TRADING SIGNAL: {data['symbol']}\n\n"
+                f"- Decision: {data['bias']}\n"
+                f"- Recommended Strike: {data['strike']}\n\n"
+                f"OPTION PREMIUM LEVELS:\n"
+                f"- Entry Premium: {prem_entry_str}\n"
+                f"- Stop Loss: {prem_sl_str}\n"
+                f"- Targets: {prem_target_str}\n\n"
+                f"SPOT INDEX LEVELS:\n"
+                f"- Spot Entry: INR {data['price']:,.2f}\n"
+                f"- Spot SL: INR {data['sl']:,.2f}\n"
+                f"- Spot Targets: INR {data['target1']:,.2f} / INR {data['target2']:,.2f}\n\n"
+                f"SIGNAL METRICS:\n"
+                f"- Risk-Reward: {data['rrr']}\n"
+                f"- Confidence Score: {data['score']}%\n"
+                f"- PCR: {data['pcr'] if data['pcr'] is not None else 'N/A'}\n\n"
+                f"Timestamp: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S IST')}"
+            )
+            st.text_area("Telegram Message Preview", value=alert_msg, height=220)
+            if st.button("Send Alert to Telegram Channel", use_container_width=True):
+                if send_telegram_alert(alert_msg):
+                    st.success("Signal broadcasted to Telegram successfully!")
+
+        with act2:
+            st.markdown("### Journal Entry Logger")
+            notes = st.text_input("Trade Notes", value=f"{data['bias']} setup logged for {data['symbol']}")
+            if st.button("Save Trade to Database", use_container_width=True):
+                log_trade(
+                    symbol=data['symbol'], price=data['price'], bias=data['bias'], strike=data['strike'],
+                    entry=data['price'], sl=data['sl'], target=data['target1'], score=data['score'],
+                    pcr=data['pcr'] if data['pcr'] is not None else -1, vix=vix_val if vix_val is not None else -1,
+                    notes=notes
+                )
+                st.success(f"Trade successfully recorded in {DB_NAME} database!")
+
+    else:
+        st.warning(f"Unable to fetch data for '{user_symbol}'. Try symbols like NIFTY, BANKNIFTY, SENSEX, RELIANCE, TCS.")
+
+with tab_journal:
+    st.markdown("### Trade History Database")
+    journal_df = get_journal_data()
+    if not journal_df.empty:
+        st.dataframe(journal_df, use_container_width=True)
+        csv = journal_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download Journal as CSV", data=csv,
+                            file_name=f"trade_journal_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}.csv",
+                            mime="text/csv")
+    else:
+        st.info("No trades logged in database yet.")
